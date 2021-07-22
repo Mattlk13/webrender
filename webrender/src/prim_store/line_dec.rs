@@ -3,21 +3,23 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use api::{
-    ColorF, ColorU,
+    ColorF, ColorU, RasterSpace,
     LineOrientation, LineStyle, PremultipliedColorF, Shadow,
 };
-use api::units::{Au, LayoutSizeAu, LayoutVector2D};
+use api::units::*;
 use crate::scene_building::{CreateShadow, IsVisible};
 use crate::frame_builder::{FrameBuildingState};
 use crate::gpu_cache::GpuDataRequest;
 use crate::intern;
 use crate::internal_types::LayoutPrimitiveInfo;
 use crate::prim_store::{
-    PrimKey, PrimKeyCommonData, PrimTemplate, PrimTemplateCommonData,
-    InternablePrimitive, PrimitiveSceneData, PrimitiveStore,
+    PrimKey, PrimTemplate, PrimTemplateCommonData,
+    InternablePrimitive, PrimitiveStore,
 };
 use crate::prim_store::PrimitiveInstanceKind;
 
+/// Maximum resolution in device pixels at which line decorations are rasterized.
+pub const MAX_LINE_DECORATION_RESOLUTION: u32 = 4096;
 
 #[derive(Clone, Debug, Hash, MallocSizeOf, PartialEq, Eq)]
 #[cfg_attr(feature = "capture", derive(Serialize))]
@@ -50,9 +52,7 @@ impl LineDecorationKey {
         line_dec: LineDecoration,
     ) -> Self {
         LineDecorationKey {
-            common: PrimKeyCommonData::with_info(
-                info,
-            ),
+            common: info.into(),
             kind: line_dec,
         }
     }
@@ -125,7 +125,8 @@ pub type LineDecorationDataHandle = intern::Handle<LineDecoration>;
 impl intern::Internable for LineDecoration {
     type Key = LineDecorationKey;
     type StoreData = LineDecorationTemplate;
-    type InternData = PrimitiveSceneData;
+    type InternData = ();
+    const PROFILE_COUNTER: usize = crate::profiler::INTERNED_LINE_DECORATIONS;
 }
 
 impl InternablePrimitive for LineDecoration {
@@ -147,13 +148,18 @@ impl InternablePrimitive for LineDecoration {
     ) -> PrimitiveInstanceKind {
         PrimitiveInstanceKind::LineDecoration {
             data_handle,
-            cache_handle: None,
+            render_task: None,
         }
     }
 }
 
 impl CreateShadow for LineDecoration {
-    fn create_shadow(&self, shadow: &Shadow) -> Self {
+    fn create_shadow(
+        &self,
+        shadow: &Shadow,
+        _: bool,
+        _: RasterSpace,
+    ) -> Self {
         LineDecoration {
             color: shadow.color.into(),
             cache_key: self.cache_key.clone(),
@@ -167,6 +173,74 @@ impl IsVisible for LineDecoration {
     }
 }
 
+/// Choose the decoration mask tile size for a given line.
+///
+/// Given a line with overall size `rect_size` and the given `orientation`,
+/// return the dimensions of a single mask tile for the decoration pattern
+/// described by `style` and `wavy_line_thickness`.
+///
+/// If `style` is `Solid`, no mask tile is necessary; return `None`. The other
+/// styles each have their own characteristic periods of repetition, so for each
+/// one, this function returns a `LayoutSize` with the right aspect ratio and
+/// whose specific size is convenient for the `cs_line_decoration.glsl` fragment
+/// shader to work with. The shader uses a local coordinate space in which the
+/// tile fills a rectangle with one corner at the origin, and with the size this
+/// function returns.
+///
+/// The returned size is not necessarily in pixels; device scaling and other
+/// concerns can still affect the actual task size.
+///
+/// Regardless of whether `orientation` is `Vertical` or `Horizontal`, the
+/// `width` and `height` of the returned size are always horizontal and
+/// vertical, respectively.
+pub fn get_line_decoration_size(
+    rect_size: &LayoutSize,
+    orientation: LineOrientation,
+    style: LineStyle,
+    wavy_line_thickness: f32,
+) -> Option<LayoutSize> {
+    let h = match orientation {
+        LineOrientation::Horizontal => rect_size.height,
+        LineOrientation::Vertical => rect_size.width,
+    };
+
+    // TODO(gw): The formulae below are based on the existing gecko and line
+    //           shader code. They give reasonable results for most inputs,
+    //           but could definitely do with a detailed pass to get better
+    //           quality on a wider range of inputs!
+    //           See nsCSSRendering::PaintDecorationLine in Gecko.
+
+    let (parallel, perpendicular) = match style {
+        LineStyle::Solid => {
+            return None;
+        }
+        LineStyle::Dashed => {
+            let dash_length = (3.0 * h).min(64.0).max(1.0);
+
+            (2.0 * dash_length, 4.0)
+        }
+        LineStyle::Dotted => {
+            let diameter = h.min(64.0).max(1.0);
+            let period = 2.0 * diameter;
+
+            (period, diameter)
+        }
+        LineStyle::Wavy => {
+            let line_thickness = wavy_line_thickness.max(1.0);
+            let slope_length = h - line_thickness;
+            let flat_length = ((line_thickness - 1.0) * 2.0).max(1.0);
+            let approx_period = 2.0 * (slope_length + flat_length);
+
+            (approx_period, h)
+        }
+    };
+
+    Some(match orientation {
+        LineOrientation::Horizontal => LayoutSize::new(parallel, perpendicular),
+        LineOrientation::Vertical => LayoutSize::new(perpendicular, parallel),
+    })
+}
+
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn test_struct_sizes() {
@@ -178,6 +252,6 @@ fn test_struct_sizes() {
     // (b) You made a structure larger. This is not necessarily a problem, but should only
     //     be done with care, and after checking if talos performance regresses badly.
     assert_eq!(mem::size_of::<LineDecoration>(), 20, "LineDecoration size changed");
-    assert_eq!(mem::size_of::<LineDecorationTemplate>(), 52, "LineDecorationTemplate size changed");
-    assert_eq!(mem::size_of::<LineDecorationKey>(), 32, "LineDecorationKey size changed");
+    assert_eq!(mem::size_of::<LineDecorationTemplate>(), 60, "LineDecorationTemplate size changed");
+    assert_eq!(mem::size_of::<LineDecorationKey>(), 40, "LineDecorationKey size changed");
 }

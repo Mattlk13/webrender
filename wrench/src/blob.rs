@@ -37,35 +37,33 @@ fn premul(x: u8, a: u8) -> u8 {
 fn render_blob(
     color: ColorU,
     descriptor: &BlobImageDescriptor,
-    tile: Option<(TileSize, TileOffset)>,
+    tile: TileOffset,
+    _tile_size: TileSize,
     dirty_rect: &BlobDirtyRect,
 ) -> BlobImageResult {
     // Allocate storage for the result. Right now the resource cache expects the
     // tiles to have have no stride or offset.
-    let buf_size = descriptor.rect.size.area() *
+    let buf_size = descriptor.rect.area() *
         descriptor.format.bytes_per_pixel();
     let mut texels = vec![0u8; (buf_size) as usize];
 
     // Generate a per-tile pattern to see it in the demo. For a real use case it would not
     // make sense for the rendered content to depend on its tile.
-    let tile_checker = match tile {
-        Some((_, tile)) => (tile.x % 2 == 0) != (tile.y % 2 == 0),
-        None => true,
-    };
+    let tile_checker = (tile.x % 2 == 0) != (tile.y % 2 == 0);
 
     let dirty_rect = dirty_rect.to_subrect_of(&descriptor.rect);
 
     // We want the dirty rect local to the tile rather than the whole image.
-    let tx: BlobToDeviceTranslation = (-descriptor.rect.origin.to_vector()).into();
+    let tx: BlobToDeviceTranslation = (-descriptor.rect.min.to_vector()).into();
 
-    let rasterized_rect = tx.transform_rect(&dirty_rect);
+    let rasterized_rect = tx.transform_box(&dirty_rect);
 
-    for y in rasterized_rect.min_y() .. rasterized_rect.max_y() {
-        for x in rasterized_rect.min_x() .. rasterized_rect.max_x() {
+    for y in rasterized_rect.min.y .. rasterized_rect.max.y {
+        for x in rasterized_rect.min.x .. rasterized_rect.max.x {
             // Apply the tile's offset. This is important: all drawing commands should be
             // translated by this offset to give correct results with tiled blob images.
-            let x2 = x + descriptor.rect.origin.x;
-            let y2 = y + descriptor.rect.origin.y;
+            let x2 = x + descriptor.rect.min.x;
+            let y2 = y + descriptor.rect.min.y;
 
             // Render a simple checkerboard pattern
             let checker = if (x2 % 20 >= 10) != (y2 % 20 >= 10) {
@@ -79,14 +77,14 @@ fn render_blob(
             match descriptor.format {
                 ImageFormat::BGRA8 => {
                     let a = color.a * checker + tc;
-                    let pixel_offset = ((y * descriptor.rect.size.width + x) * 4) as usize;
+                    let pixel_offset = ((y * descriptor.rect.width() + x) * 4) as usize;
                     texels[pixel_offset + 0] = premul(color.b * checker + tc, a);
                     texels[pixel_offset + 1] = premul(color.g * checker + tc, a);
                     texels[pixel_offset + 2] = premul(color.r * checker + tc, a);
                     texels[pixel_offset + 3] = a;
                 }
                 ImageFormat::R8 => {
-                    texels[(y * descriptor.rect.size.width + x) as usize] = color.a * checker + tc;
+                    texels[(y * descriptor.rect.width() + x) as usize] = color.a * checker + tc;
                 }
                 _ => {
                     return Err(BlobImageError::Other(
@@ -116,7 +114,7 @@ impl BlobCallbacks {
 }
 
 pub struct CheckerboardRenderer {
-    image_cmds: HashMap<BlobImageKey, (ColorU, Option<TileSize>)>,
+    image_cmds: HashMap<BlobImageKey, (ColorU, TileSize)>,
     callbacks: Arc<Mutex<BlobCallbacks>>,
 }
 
@@ -130,8 +128,12 @@ impl CheckerboardRenderer {
 }
 
 impl BlobImageHandler for CheckerboardRenderer {
+    fn create_similar(&self) -> Box<dyn BlobImageHandler> {
+        Box::new(CheckerboardRenderer::new(Arc::clone(&self.callbacks)))
+    }
+
     fn add(&mut self, key: BlobImageKey, cmds: Arc<BlobImageData>,
-           _visible_rect: &DeviceIntRect, tile_size: Option<TileSize>) {
+           _visible_rect: &DeviceIntRect, tile_size: TileSize) {
         self.image_cmds
             .insert(key, (deserialize_blob(&cmds[..]).unwrap(), tile_size));
     }
@@ -166,18 +168,21 @@ impl BlobImageHandler for CheckerboardRenderer {
     fn create_blob_rasterizer(&mut self) -> Box<dyn AsyncBlobImageRasterizer> {
         Box::new(Rasterizer { image_cmds: self.image_cmds.clone() })
     }
+
+    fn enable_multithreading(&mut self, _enable: bool) {}
 }
 
 struct Command {
     request: BlobImageRequest,
     color: ColorU,
     descriptor: BlobImageDescriptor,
-    tile: Option<(TileSize, TileOffset)>,
+    tile: TileOffset,
+    tile_size: TileSize,
     dirty_rect: BlobDirtyRect,
 }
 
 struct Rasterizer {
-    image_cmds: HashMap<BlobImageKey, (ColorU, Option<TileSize>)>,
+    image_cmds: HashMap<BlobImageKey, (ColorU, TileSize)>,
 }
 
 impl AsyncBlobImageRasterizer for Rasterizer {
@@ -190,12 +195,11 @@ impl AsyncBlobImageRasterizer for Rasterizer {
             |item| {
                 let (color, tile_size) = self.image_cmds[&item.request.key];
 
-                let tile = item.request.tile.map(|tile| (tile_size.unwrap(), tile));
-
                 Command {
                     request: item.request,
                     color,
-                    tile,
+                    tile_size,
+                    tile: item.request.tile,
                     descriptor: item.descriptor,
                     dirty_rect: item.dirty_rect,
                 }
@@ -203,7 +207,7 @@ impl AsyncBlobImageRasterizer for Rasterizer {
         ).collect();
 
         requests.iter().map(|cmd| {
-            (cmd.request, render_blob(cmd.color, &cmd.descriptor, cmd.tile, &cmd.dirty_rect))
+            (cmd.request, render_blob(cmd.color, &cmd.descriptor, cmd.tile, cmd.tile_size, &cmd.dirty_rect))
         }).collect()
     }
 }

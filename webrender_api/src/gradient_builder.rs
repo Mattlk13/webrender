@@ -99,6 +99,25 @@ impl GradientBuilder {
         }
     }
 
+    /// Produce a conic gradient, normalize the stops.
+    pub fn conic_gradient(
+        &mut self,
+        center: LayoutPoint,
+        angle: f32,
+        extend_mode: di::ExtendMode,
+    ) -> di::ConicGradient {
+        let (start_offset, end_offset) =
+            self.normalize(extend_mode);
+
+        di::ConicGradient {
+            center,
+            angle,
+            start_offset,
+            end_offset,
+            extend_mode,
+        }
+    }
+
     /// Gradients can be defined with stops outside the range of [0, 1]
     /// when this happens the gradient needs to be normalized by adjusting
     /// the gradient stops and gradient line into an equivalent gradient
@@ -113,7 +132,9 @@ impl GradientBuilder {
         let first = *stops.first().unwrap();
         let last = *stops.last().unwrap();
 
-        assert!(first.offset <= last.offset);
+        // Express the assertion so that if one of the offsets is NaN, we don't panic
+        // and instead take the branch that handles degenerate gradients.
+        assert!(!(first.offset > last.offset));
 
         let stops_delta = last.offset - first.offset;
 

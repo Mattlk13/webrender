@@ -4,15 +4,19 @@
 
 #![deny(missing_docs)]
 
-use euclid::{size2, Rect, num::Zero};
+use euclid::{size2, Box2D, num::Zero};
 use peek_poke::PeekPoke;
 use std::ops::{Add, Sub};
 use std::sync::Arc;
 // local imports
-use crate::api::{IdNamespace, PipelineId, TileSize};
+use crate::{IdNamespace, TileSize};
 use crate::display_item::ImageRendering;
 use crate::font::{FontInstanceKey, FontInstanceData, FontKey, FontTemplate};
 use crate::units::*;
+
+/// The default tile size for blob images and regular images larger than
+/// the maximum texture size.
+pub const DEFAULT_TILE_SIZE: TileSize = 512;
 
 /// An opaque identifier describing an image registered with WebRender.
 /// This is used as a handle to reference images, and is used as the
@@ -46,7 +50,7 @@ pub struct BlobImageKey(pub ImageKey);
 
 impl BlobImageKey {
     /// Interpret this blob image as an image for a display item.
-    pub fn as_image(&self) -> ImageKey {
+    pub fn as_image(self) -> ImageKey {
         self.0
     }
 }
@@ -96,38 +100,24 @@ pub trait ExternalImageHandler {
     fn unlock(&mut self, key: ExternalImageId, channel_index: u8);
 }
 
-/// Allows callers to receive a texture with the contents of a specific
-/// pipeline copied to it.
-pub trait OutputImageHandler {
-    /// Return the native texture handle and the size of the texture.
-    fn lock(&mut self, pipeline_id: PipelineId) -> Option<(u32, FramebufferIntSize)>;
-    /// Unlock will only be called if the lock() call succeeds, when WR has issued
-    /// the GL commands to copy the output to the texture handle.
-    fn unlock(&mut self, pipeline_id: PipelineId);
-}
-
 /// Specifies the type of texture target in driver terms.
 #[repr(u8)]
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-pub enum TextureTarget {
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub enum ImageBufferKind {
     /// Standard texture. This maps to GL_TEXTURE_2D in OpenGL.
-    Default = 0,
-    /// Array texture. This maps to GL_TEXTURE_2D_ARRAY in OpenGL. See
-    /// https://www.khronos.org/opengl/wiki/Array_Texture for background
-    /// on Array textures.
-    Array = 1,
+    Texture2D = 0,
     /// Rectangle texture. This maps to GL_TEXTURE_RECTANGLE in OpenGL. This
     /// is similar to a standard texture, with a few subtle differences
     /// (no mipmaps, non-power-of-two dimensions, different coordinate space)
     /// that make it useful for representing the kinds of textures we use
     /// in WebRender. See https://www.khronos.org/opengl/wiki/Rectangle_Texture
     /// for background on Rectangle textures.
-    Rect = 2,
+    TextureRect = 1,
     /// External texture. This maps to GL_TEXTURE_EXTERNAL_OES in OpenGL, which
     /// is an extension. This is used for image formats that OpenGL doesn't
     /// understand, particularly YUV. See
     /// https://www.khronos.org/registry/OpenGL/extensions/OES/OES_EGL_image_external.txt
-    External = 3,
+    TextureExternal = 2,
 }
 
 /// Storage format identifier for externally-managed images.
@@ -135,7 +125,7 @@ pub enum TextureTarget {
 #[derive(Debug, Copy, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ExternalImageType {
     /// The image is texture-backed.
-    TextureHandle(TextureTarget),
+    TextureHandle(ImageBufferKind),
     /// The image is heap-allocated by the embedding.
     Buffer,
 }
@@ -251,10 +241,6 @@ bitflags! {
         ///
         /// See https://github.com/servo/webrender/pull/2555/
         const ALLOW_MIPMAPS = 2;
-        /// This is used as a performance hint - this image may be promoted to a native
-        /// compositor surface under certain (implementation specific) conditions. This
-        /// is typically used for large videos, and canvas elements.
-        const PREFER_COMPOSITOR_SURFACE = 4;
     }
 }
 
@@ -310,7 +296,7 @@ impl ImageDescriptor {
 
     /// Computes the bounding rectangle for the image, rooted at (0, 0).
     pub fn full_rect(&self) -> DeviceIntRect {
-        DeviceIntRect::new(
+        DeviceIntRect::from_origin_and_size(
             DeviceIntPoint::zero(),
             self.size,
         )
@@ -324,12 +310,6 @@ impl ImageDescriptor {
     /// Returns true if this descriptor allows mipmaps
     pub fn allow_mipmaps(&self) -> bool {
         self.flags.contains(ImageDescriptorFlags::ALLOW_MIPMAPS)
-    }
-
-    /// Returns true if this descriptor wants to be drawn as a native
-    /// compositor surface.
-    pub fn prefer_compositor_surface(&self) -> bool {
-        self.flags.contains(ImageDescriptorFlags::PREFER_COMPOSITOR_SURFACE)
     }
 }
 
@@ -389,6 +369,11 @@ pub trait BlobImageHandler: Send {
     /// Creates a snapshot of the current state of blob images in the handler.
     fn create_blob_rasterizer(&mut self) -> Box<dyn AsyncBlobImageRasterizer>;
 
+    /// Creates an empty blob handler of the same type.
+    ///
+    /// This is used to allow creating new API endpoints with blob handlers installed on them.
+    fn create_similar(&self) -> Box<dyn BlobImageHandler>;
+
     /// A hook to let the blob image handler update any state related to resources that
     /// are not bundled in the blob recording itself.
     fn prepare_resources(
@@ -399,7 +384,7 @@ pub trait BlobImageHandler: Send {
 
     /// Register a blob image.
     fn add(&mut self, key: BlobImageKey, data: Arc<BlobImageData>, visible_rect: &DeviceIntRect,
-           tiling: Option<TileSize>);
+           tile_size: TileSize);
 
     /// Update an already registered blob image.
     fn update(&mut self, key: BlobImageKey, data: Arc<BlobImageData>, visible_rect: &DeviceIntRect,
@@ -419,6 +404,9 @@ pub trait BlobImageHandler: Send {
     /// A hook to let the handler clean up any state related a given namespace before the
     /// resource cache deletes them.
     fn clear_namespace(&mut self, namespace: IdNamespace);
+
+    /// Whether to allow rendering blobs on multiple threads.
+    fn enable_multithreading(&mut self, enable: bool);
 }
 
 /// A group of rasterization requests to execute synchronously on the scene builder thread.
@@ -451,13 +439,13 @@ pub struct BlobImageParams {
 
 /// The possible states of a Dirty rect.
 ///
-/// This exists because people kept getting confused with `Option<Rect>`.
+/// This exists because people kept getting confused with `Option<Box2D>`.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum DirtyRect<T: Copy, U> {
     /// Everything is Dirty, equivalent to Partial(image_bounds)
     All,
     /// Some specific amount is dirty
-    Partial(Rect<T, U>)
+    Partial(Box2D<T, U>)
 }
 
 impl<T, U> DirtyRect<T, U>
@@ -470,7 +458,7 @@ where
 {
     /// Creates an empty DirtyRect (indicating nothing is invalid)
     pub fn empty() -> Self {
-        DirtyRect::Partial(Rect::zero())
+        DirtyRect::Partial(Box2D::zero())
     }
 
     /// Returns whether the dirty rect is empty
@@ -488,7 +476,7 @@ where
 
     /// Maps over the contents of Partial.
     pub fn map<F>(self, func: F) -> Self
-        where F: FnOnce(Rect<T, U>) -> Rect<T, U>,
+        where F: FnOnce(Box2D<T, U>) -> Box2D<T, U>,
     {
         use crate::DirtyRect::*;
 
@@ -514,19 +502,21 @@ where
 
         match (*self, *other) {
             (All, rect) | (rect, All)  => rect,
-            (Partial(rect1), Partial(rect2)) => Partial(rect1.intersection(&rect2)
-                                                                   .unwrap_or_else(Rect::zero))
+            (Partial(rect1), Partial(rect2)) => {
+                Partial(rect1.intersection(&rect2).unwrap_or_else(Box2D::zero))
+            }
         }
     }
 
     /// Converts the dirty rect into a subrect of the given one via intersection.
-    pub fn to_subrect_of(&self, rect: &Rect<T, U>) -> Rect<T, U> {
+    pub fn to_subrect_of(&self, rect: &Box2D<T, U>) -> Box2D<T, U> {
         use crate::DirtyRect::*;
 
         match *self {
-            All              => *rect,
-            Partial(dirty_rect) => dirty_rect.intersection(rect)
-                                               .unwrap_or_else(Rect::zero),
+            All => *rect,
+            Partial(dirty_rect) => {
+                dirty_rect.intersection(rect).unwrap_or_else(Box2D::zero)
+            }
         }
     }
 }
@@ -536,8 +526,8 @@ impl<T: Copy, U> Clone for DirtyRect<T, U> {
     fn clone(&self) -> Self { *self }
 }
 
-impl<T: Copy, U> From<Rect<T, U>> for DirtyRect<T, U> {
-    fn from(rect: Rect<T, U>) -> Self {
+impl<T: Copy, U> From<Box2D<T, U>> for DirtyRect<T, U> {
+    fn from(rect: Box2D<T, U>) -> Self {
         DirtyRect::Partial(rect)
     }
 }
@@ -586,8 +576,6 @@ pub enum BlobImageError {
 pub struct BlobImageRequest {
     /// Unique handle to the image.
     pub key: BlobImageKey,
-    /// Tiling offset in number of tiles, if applicable.
-    ///
-    /// `None` if the image will not be tiled.
-    pub tile: Option<TileOffset>,
+    /// Tiling offset in number of tiles.
+    pub tile: TileOffset,
 }

@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-#include shared,ellipse
+#include shared,rect,ellipse
 
 // For edges, the colors are the same. For corners, these
 // are the colors of each edge making up the corner.
@@ -16,7 +16,11 @@ flat varying vec4 vColor11;
 flat varying vec4 vColorLine;
 
 // x = segment, y = styles, z = edge axes, w = clip mode
-flat varying ivec4 vConfig;
+// Since by default in GLES the vertex shader uses highp 
+// and the fragment shader uses mediump, we explicitely 
+// use mediump precision so we align with the default 
+// mediump precision in the fragment shader.
+flat varying mediump ivec4 vConfig;
 
 // xy = Local space position of the clip center.
 // zw = Scale the rect origin by this to get the outer
@@ -68,15 +72,15 @@ varying vec2 vPos;
 
 #ifdef WR_VERTEX_SHADER
 
-in vec2 aTaskOrigin;
-in vec4 aRect;
-in vec4 aColor0;
-in vec4 aColor1;
-in int aFlags;
-in vec2 aWidths;
-in vec2 aRadii;
-in vec4 aClipParams1;
-in vec4 aClipParams2;
+PER_INSTANCE in vec2 aTaskOrigin;
+PER_INSTANCE in vec4 aRect;
+PER_INSTANCE in vec4 aColor0;
+PER_INSTANCE in vec4 aColor1;
+PER_INSTANCE in int aFlags;
+PER_INSTANCE in vec2 aWidths;
+PER_INSTANCE in vec2 aRadii;
+PER_INSTANCE in vec4 aClipParams1;
+PER_INSTANCE in vec4 aClipParams2;
 
 vec2 get_outer_corner_scale(int segment) {
     vec2 p;
@@ -154,8 +158,9 @@ void main(void) {
     int style1 = (aFlags >> 16) & 0xff;
     int clip_mode = (aFlags >> 24) & 0x0f;
 
+    vec2 size = aRect.zw - aRect.xy;
     vec2 outer_scale = get_outer_corner_scale(segment);
-    vec2 outer = outer_scale * aRect.zw;
+    vec2 outer = outer_scale * size;
     vec2 clip_sign = 1.0 - 2.0 * outer_scale;
 
     // Set some flags used by the FS to determine the
@@ -193,12 +198,12 @@ void main(void) {
 
     vConfig = ivec4(
         segment,
-        style0 | (style1 << 16),
-        edge_axis.x | (edge_axis.y << 16),
+        style0 | (style1 << 8),
+        edge_axis.x | (edge_axis.y << 8),
         clip_mode
     );
     vPartialWidths = vec4(aWidths / 3.0, aWidths / 2.0);
-    vPos = aRect.zw * aPosition.xy;
+    vPos = size * aPosition.xy;
 
     vec4[2] color0 = get_colors_for_side(aColor0, style0);
     vColor00 = color0[0];
@@ -224,7 +229,7 @@ void main(void) {
             radius += 2.0;
 
         vPos = vClipParams1.xy + radius * (2.0 * aPosition.xy - 1.0);
-        vPos = clamp(vPos, vec2(0.0), aRect.zw);
+        vPos = clamp(vPos, vec2(0.0), size);
     } else if (clip_mode == CLIP_DASH_CORNER) {
         vec2 center = (aClipParams1.xy + aClipParams2.xy) * 0.5;
         // This is a gross approximation which works out because dashes don't have
@@ -261,13 +266,11 @@ vec4 evaluate_color_for_style_in_corner(
             // third of the rounded edge.
             float d_radii_a = distance_to_ellipse(
                 clip_relative_pos,
-                clip_radii.xy - vPartialWidths.xy,
-                aa_range
+                clip_radii.xy - vPartialWidths.xy
             );
             float d_radii_b = distance_to_ellipse(
                 clip_relative_pos,
-                clip_radii.xy - 2.0 * vPartialWidths.xy,
-                aa_range
+                clip_radii.xy - 2.0 * vPartialWidths.xy
             );
             float d = min(-d_radii_a, d_radii_b);
             color0 *= distance_aa(aa_range, d);
@@ -277,8 +280,7 @@ vec4 evaluate_color_for_style_in_corner(
         case BORDER_STYLE_RIDGE: {
             float d = distance_to_ellipse(
                 clip_relative_pos,
-                clip_radii.xy - vPartialWidths.zw,
-                aa_range
+                clip_radii.xy - vPartialWidths.zw
             );
             float alpha = distance_aa(aa_range, d);
             float swizzled_factor;
@@ -345,8 +347,8 @@ void main(void) {
     vec4 color0, color1;
 
     int segment = vConfig.x;
-    ivec2 style = ivec2(vConfig.y & 0xffff, vConfig.y >> 16);
-    ivec2 edge_axis = ivec2(vConfig.z & 0xffff, vConfig.z >> 16);
+    ivec2 style = ivec2(vConfig.y & 0xff, vConfig.y >> 8);
+    ivec2 edge_axis = ivec2(vConfig.z & 0xff, vConfig.z >> 8);
     int clip_mode = vConfig.w;
 
     float mix_factor = 0.0;
@@ -398,8 +400,8 @@ void main(void) {
     }
 
     if (in_clip_region) {
-        float d_radii_a = distance_to_ellipse(clip_relative_pos, vClipRadii.xy, aa_range);
-        float d_radii_b = distance_to_ellipse(clip_relative_pos, vClipRadii.zw, aa_range);
+        float d_radii_a = distance_to_ellipse(clip_relative_pos, vClipRadii.xy);
+        float d_radii_b = distance_to_ellipse(clip_relative_pos, vClipRadii.zw);
         float d_radii = max(d_radii_a, -d_radii_b);
         d = max(d, d_radii);
 

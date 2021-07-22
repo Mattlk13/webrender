@@ -42,7 +42,7 @@ tasks:
       $if: should_run
       then:
         # For the docker-worker tasks, the Docker image used
-        # (staktrace/webrender-test:debian-v3) was created using the Dockerfile in
+        # (staktrace/webrender-test:debian-v9) was created using the Dockerfile in
         # ci-scripts/docker-image.
         #
         # The docker image may need to be updated over time if the set of required
@@ -61,15 +61,10 @@ tasks:
           deadline: {$fromNow: '1 day'}
           payload:
             maxRunTime: 7200
-            image: 'staktrace/webrender-test:debian-v3'
+            image: 'staktrace/webrender-test:debian-v9'
             env:
               RUST_BACKTRACE: 'full'
-              #############################################################
-              ### Temporarily disable until https://bugzil.la/1564873 lands
-              ### in order to unblock https://bugzil.la/1575648 (which is
-              ### time-critical)
-              # RUSTFLAGS: '--deny warnings'
-              #############################################################
+              RUSTFLAGS: '--deny warnings'
             command:
               - /bin/bash
               - '--login'
@@ -80,6 +75,8 @@ tasks:
                 git clone ${repo_url} webrender && cd webrender &&
                 git checkout ${sha} &&
                 servo-tidy &&
+                ci-scripts/install-meson.sh &&
+                export PATH=$PATH:$PWD/meson &&
                 ci-scripts/linux-release-tests.sh
           routes:
             - "index.project.webrender.ci.${login}.${branch}.linux-release"
@@ -93,15 +90,10 @@ tasks:
           deadline: {$fromNow: '1 day'}
           payload:
             maxRunTime: 7200
-            image: 'staktrace/webrender-test:debian-v3'
+            image: 'staktrace/webrender-test:debian-v9'
             env:
               RUST_BACKTRACE: 'full'
-              #############################################################
-              ### Temporarily disable until https://bugzil.la/1564873 lands
-              ### in order to unblock https://bugzil.la/1575648 (which is
-              ### time-critical)
-              # RUSTFLAGS: '--deny warnings'
-              #############################################################
+              RUSTFLAGS: '--deny warnings'
             command:
               - /bin/bash
               - '--login'
@@ -112,6 +104,8 @@ tasks:
                 git clone ${repo_url} webrender && cd webrender &&
                 git checkout ${sha} &&
                 servo-tidy &&
+                ci-scripts/install-meson.sh &&
+                export PATH=$PATH:$PWD/meson &&
                 ci-scripts/linux-debug-tests.sh
           routes:
             - "index.project.webrender.ci.${login}.${branch}.linux-debug"
@@ -119,76 +113,68 @@ tasks:
         # Mozilla releng doesn't have any spare OS X machines for us at this time.
         # Talk to :kats or :jrmuizel if you need more details about this. The machines
         # are hooked up to taskcluster using taskcluster-worker; they use a workerpool
-        # of webrender/ci-macos. They are set up with all the dependencies needed
-        # to build and test webrender, including Rust (currently 1.30), servo-tidy,
+        # of proj-webrender/ci-macos. They are set up with all the dependencies needed
+        # to build and test webrender, including Rust (currently 1.41.1), servo-tidy,
         # mako, zlib, etc. Note that unlike the docker-worker used for Linux, these
         # machines WILL persist state from one run to the next, so any cleanup needs
         # to be handled explicitly.
-        - metadata:
-            name: OS X release tests
-            description: Runs release-mode WebRender CI stuff on a OS X TC worker
-            owner: noreply@mozilla.com
-            source: ${repo_url}
-          provisionerId: 'proj-webrender'
-          workerType: 'ci-macos'
-          deadline: {$fromNow: '1 day'}
-          payload:
-            maxRunTime: 3600
-            command:
-              - - /bin/bash
-                - '--login'
-                - '-vec'
-                - |
-                  git clone ${repo_url} webrender
-                  cd webrender
-                  git checkout ${sha}
-                  source $HOME/servotidy-venv/bin/activate
-                  servo-tidy
-                  export RUST_BACKTRACE=full
-                  #############################################################
-                  ### Temporarily disable until https://bugzil.la/1564873 lands
-                  ### in order to unblock https://bugzil.la/1575648 (which is
-                  ### time-critical)
-                  # export RUSTFLAGS='--deny warnings'
-                  #############################################################
-                  export PKG_CONFIG_PATH="/usr/local/opt/zlib/lib/pkgconfig:$PKG_CONFIG_PATH"
-                  echo 'exec make -j1 "$@"' > $HOME/make # See #2638
-                  chmod +x $HOME/make
-                  export MAKE="$HOME/make"
-                  ci-scripts/macos-release-tests.sh
-          routes:
-            - "index.project.webrender.ci.${login}.${branch}.osx-release"
-        - metadata:
-            name: OS X debug tests
-            description: Runs debug-mode WebRender CI stuff on a OS X TC worker
-            owner: noreply@mozilla.com
-            source: ${repo_url}
-          provisionerId: 'proj-webrender'
-          workerType: 'ci-macos'
-          deadline: {$fromNow: '1 day'}
-          payload:
-            maxRunTime: 3600
-            command:
-              - - /bin/bash
-                - '--login'
-                - '-vec'
-                - |
-                  git clone ${repo_url} webrender
-                  cd webrender
-                  git checkout ${sha}
-                  source $HOME/servotidy-venv/bin/activate
-                  servo-tidy
-                  export RUST_BACKTRACE=full
-                  #############################################################
-                  ### Temporarily disable until https://bugzil.la/1564873 lands
-                  ### in order to unblock https://bugzil.la/1575648 (which is
-                  ### time-critical)
-                  # export RUSTFLAGS='--deny warnings'
-                  #############################################################
-                  export PKG_CONFIG_PATH="/usr/local/opt/zlib/lib/pkgconfig:$PKG_CONFIG_PATH"
-                  echo 'exec make -j1 "$@"' > $HOME/make # See #2638
-                  chmod +x $HOME/make
-                  export MAKE="$HOME/make"
-                  ci-scripts/macos-debug-tests.sh
-          routes:
-            - "index.project.webrender.ci.${login}.${branch}.osx-debug"
+
+        # macOS tasks currently disabled, see bug 1639217.
+        # - metadata:
+        #     name: OS X release tests
+        #     description: Runs release-mode WebRender CI stuff on a OS X TC worker
+        #     owner: noreply@mozilla.com
+        #     source: ${repo_url}
+        #   provisionerId: 'proj-webrender'
+        #   workerType: 'ci-macos'
+        #   deadline: {$fromNow: '1 day'}
+        #   payload:
+        #     maxRunTime: 3600
+        #     command:
+        #       - - /bin/bash
+        #         - '--login'
+        #         - '-vec'
+        #         - |
+        #           git clone ${repo_url} webrender
+        #           cd webrender
+        #           git checkout ${sha}
+        #           source $HOME/servotidy-venv/bin/activate
+        #           servo-tidy
+        #           export RUST_BACKTRACE=full
+        #           export RUSTFLAGS='--deny warnings'
+        #           export PKG_CONFIG_PATH="/usr/local/opt/zlib/lib/pkgconfig:$PKG_CONFIG_PATH"
+        #           echo 'exec make -j1 "$@"' > $HOME/make # See #2638
+        #           chmod +x $HOME/make
+        #           export MAKE="$HOME/make"
+        #           ci-scripts/macos-release-tests.sh
+        #   routes:
+        #     - "index.project.webrender.ci.${login}.${branch}.osx-release"
+        # - metadata:
+        #     name: OS X debug tests
+        #     description: Runs debug-mode WebRender CI stuff on a OS X TC worker
+        #     owner: noreply@mozilla.com
+        #     source: ${repo_url}
+        #   provisionerId: 'proj-webrender'
+        #   workerType: 'ci-macos'
+        #   deadline: {$fromNow: '1 day'}
+        #   payload:
+        #     maxRunTime: 3600
+        #     command:
+        #       - - /bin/bash
+        #         - '--login'
+        #         - '-vec'
+        #         - |
+        #           git clone ${repo_url} webrender
+        #           cd webrender
+        #           git checkout ${sha}
+        #           source $HOME/servotidy-venv/bin/activate
+        #           servo-tidy
+        #           export RUST_BACKTRACE=full
+        #           export RUSTFLAGS='--deny warnings'
+        #           export PKG_CONFIG_PATH="/usr/local/opt/zlib/lib/pkgconfig:$PKG_CONFIG_PATH"
+        #           echo 'exec make -j1 "$@"' > $HOME/make # See #2638
+        #           chmod +x $HOME/make
+        #           export MAKE="$HOME/make"
+        #           ci-scripts/macos-debug-tests.sh
+        #   routes:
+        #     - "index.project.webrender.ci.${login}.${branch}.osx-debug"

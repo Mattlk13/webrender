@@ -14,6 +14,7 @@ mod image_helper;
 
 use crate::boilerplate::{Example, HandyDandyRectBuilder};
 use webrender::api::*;
+use webrender::render_api::*;
 use webrender::api::units::*;
 
 struct App {
@@ -23,7 +24,7 @@ struct App {
 impl Example for App {
     fn render(
         &mut self,
-        _api: &RenderApi,
+        _api: &mut RenderApi,
         builder: &mut DisplayListBuilder,
         txn: &mut Transaction,
         _device_size: DeviceIntSize,
@@ -42,7 +43,7 @@ impl Example for App {
         let space_and_clip = SpaceAndClipInfo::root_scroll(pipeline_id);
 
         builder.push_simple_stacking_context(
-            bounds.origin,
+            bounds.min,
             space_and_clip.spatial_id,
             PrimitiveFlags::IS_BACKFACE_VISIBLE,
         );
@@ -51,7 +52,7 @@ impl Example for App {
 
         builder.push_image(
             &CommonItemProperties::new(
-                LayoutRect::new(LayoutPoint::new(100.0, 100.0), image_size),
+                LayoutRect::from_origin_and_size(LayoutPoint::new(100.0, 100.0), image_size),
                 space_and_clip,
             ),
             bounds,
@@ -63,7 +64,7 @@ impl Example for App {
 
         builder.push_image(
             &CommonItemProperties::new(
-                LayoutRect::new(LayoutPoint::new(250.0, 100.0), image_size),
+                LayoutRect::from_origin_and_size(LayoutPoint::new(250.0, 100.0), image_size),
                 space_and_clip,
             ),
             bounds,
@@ -76,7 +77,7 @@ impl Example for App {
         builder.pop_stacking_context();
     }
 
-    fn on_event(&mut self, event: winit::WindowEvent, api: &RenderApi, document_id: DocumentId) -> bool {
+    fn on_event(&mut self, event: winit::WindowEvent, api: &mut RenderApi, document_id: DocumentId) -> bool {
         match event {
             winit::WindowEvent::KeyboardInput {
                 input: winit::KeyboardInput {
@@ -103,7 +104,7 @@ impl Example for App {
                     &DirtyRect::All,
                 );
                 let mut txn = Transaction::new();
-                txn.generate_frame();
+                txn.generate_frame(0);
                 api.send_transaction(document_id, txn);
             }
             _ => {}

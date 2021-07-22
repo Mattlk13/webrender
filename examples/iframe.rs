@@ -12,6 +12,7 @@ mod boilerplate;
 
 use crate::boilerplate::{Example, HandyDandyRectBuilder};
 use webrender::api::*;
+use webrender::render_api::*;
 use webrender::api::units::*;
 
 // This example uses the push_iframe API to nest a second pipeline's displaylist
@@ -23,7 +24,7 @@ struct App {}
 impl Example for App {
     fn render(
         &mut self,
-        api: &RenderApi,
+        api: &mut RenderApi,
         builder: &mut DisplayListBuilder,
         _txn: &mut Transaction,
         _device_size: DeviceIntSize,
@@ -35,11 +36,11 @@ impl Example for App {
         let sub_bounds = (0, 0).to(sub_size.width as i32, sub_size.height as i32);
 
         let sub_pipeline_id = PipelineId(pipeline_id.0, 42);
-        let mut sub_builder = DisplayListBuilder::new(sub_pipeline_id, sub_bounds.size);
+        let mut sub_builder = DisplayListBuilder::new(sub_pipeline_id);
         let mut space_and_clip = SpaceAndClipInfo::root_scroll(pipeline_id);
 
         sub_builder.push_simple_stacking_context(
-            sub_bounds.origin,
+            sub_bounds.min,
             space_and_clip.spatial_id,
             PrimitiveFlags::IS_BACKFACE_VISIBLE,
         );
@@ -47,6 +48,7 @@ impl Example for App {
         // green rect visible == success
         sub_builder.push_rect(
             &CommonItemProperties::new(sub_bounds, space_and_clip),
+            sub_bounds,
             ColorF::new(0.0, 1.0, 0.0, 1.0)
         );
         sub_builder.pop_stacking_context();
@@ -55,23 +57,26 @@ impl Example for App {
         txn.set_display_list(
             Epoch(0),
             None,
-            sub_bounds.size,
+            sub_bounds.size(),
             sub_builder.finalize(),
             true,
         );
         api.send_transaction(document_id, txn);
 
         space_and_clip.spatial_id = builder.push_reference_frame(
-            sub_bounds.origin,
+            sub_bounds.min,
             space_and_clip.spatial_id,
             TransformStyle::Flat,
             PropertyBinding::Binding(PropertyBindingKey::new(42), LayoutTransform::identity()),
-            ReferenceFrameKind::Transform,
+            ReferenceFrameKind::Transform {
+                is_2d_scale_translation: false,
+                should_snap: false,
+            },
         );
 
         // And this is for the root pipeline
         builder.push_simple_stacking_context(
-            sub_bounds.origin,
+            sub_bounds.min,
             space_and_clip.spatial_id,
             PrimitiveFlags::IS_BACKFACE_VISIBLE,
         );
@@ -79,6 +84,7 @@ impl Example for App {
         // red rect under the iframe: if this is visible, things have gone wrong
         builder.push_rect(
             &CommonItemProperties::new(sub_bounds, space_and_clip),
+            sub_bounds,
             ColorF::new(1.0, 0.0, 0.0, 1.0)
         );
         builder.push_iframe(sub_bounds, sub_bounds, &space_and_clip, sub_pipeline_id, false);

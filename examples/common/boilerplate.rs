@@ -10,6 +10,7 @@ use webrender;
 use winit;
 use webrender::{DebugFlags, ShaderPrecacheFlags};
 use webrender::api::*;
+use webrender::render_api::*;
 use webrender::api::units::*;
 
 struct Notifier {
@@ -29,7 +30,7 @@ impl RenderNotifier for Notifier {
         })
     }
 
-    fn wake_up(&self) {
+    fn wake_up(&self, _composite_needed: bool) {
         #[cfg(not(target_os = "android"))]
         let _ = self.events_proxy.wakeup();
     }
@@ -37,9 +38,9 @@ impl RenderNotifier for Notifier {
     fn new_frame_ready(&self,
                        _: DocumentId,
                        _scrolled: bool,
-                       _composite_needed: bool,
+                       composite_needed: bool,
                        _render_time: Option<u64>) {
-        self.wake_up();
+        self.wake_up(composite_needed);
     }
 }
 
@@ -51,14 +52,14 @@ pub trait HandyDandyRectBuilder {
 // values to build a f32 LayoutRect
 impl HandyDandyRectBuilder for (i32, i32) {
     fn to(&self, x2: i32, y2: i32) -> LayoutRect {
-        LayoutRect::new(
+        LayoutRect::from_origin_and_size(
             LayoutPoint::new(self.0 as f32, self.1 as f32),
             LayoutSize::new((x2 - self.0) as f32, (y2 - self.1) as f32),
         )
     }
 
     fn by(&self, w: i32, h: i32) -> LayoutRect {
-        LayoutRect::new(
+        LayoutRect::from_origin_and_size(
             LayoutPoint::new(self.0 as f32, self.1 as f32),
             LayoutSize::new(w as f32, h as f32),
         )
@@ -73,7 +74,7 @@ pub trait Example {
 
     fn render(
         &mut self,
-        api: &RenderApi,
+        api: &mut RenderApi,
         builder: &mut DisplayListBuilder,
         txn: &mut Transaction,
         device_size: DeviceIntSize,
@@ -83,17 +84,16 @@ pub trait Example {
     fn on_event(
         &mut self,
         _: winit::WindowEvent,
-        _: &RenderApi,
+        _: &mut RenderApi,
         _: DocumentId,
     ) -> bool {
         false
     }
-    fn get_image_handlers(
+    fn get_image_handler(
         &mut self,
         _gl: &dyn gl::Gl,
-    ) -> (Option<Box<dyn ExternalImageHandler>>,
-          Option<Box<dyn OutputImageHandler>>) {
-        (None, None)
+    ) -> Option<Box<dyn ExternalImageHandler>> {
+        None
     }
     fn draw_custom(&mut self, _gl: &dyn gl::Gl) {
     }
@@ -162,9 +162,7 @@ pub fn main_wrapper<E: Example>(
     let opts = webrender::RendererOptions {
         resource_override_path: res_path,
         precache_flags: E::PRECACHE_SHADER_FLAGS,
-        device_pixel_ratio,
-        clear_color: Some(ColorF::new(0.3, 0.0, 0.0, 1.0)),
-        //scatter_gpu_cache_updates: false,
+        clear_color: ColorF::new(0.3, 0.0, 0.0, 1.0),
         debug_flags,
         //allow_texture_swizzling: false,
         ..options.unwrap_or(webrender::RendererOptions::default())
@@ -184,16 +182,11 @@ pub fn main_wrapper<E: Example>(
         notifier,
         opts,
         None,
-        device_size,
     ).unwrap();
-    let api = sender.create_api();
-    let document_id = api.add_document(device_size, 0);
+    let mut api = sender.create_api();
+    let document_id = api.add_document(device_size);
 
-    let (external, output) = example.get_image_handlers(&*gl);
-
-    if let Some(output_image_handler) = output {
-        renderer.set_output_image_handler(output_image_handler);
-    }
+    let external = example.get_image_handler(&*gl);
 
     if let Some(external_image_handler) = external {
         renderer.set_external_image_handler(external_image_handler);
@@ -202,11 +195,11 @@ pub fn main_wrapper<E: Example>(
     let epoch = Epoch(0);
     let pipeline_id = PipelineId(0, 0);
     let layout_size = device_size.to_f32() / euclid::Scale::new(device_pixel_ratio);
-    let mut builder = DisplayListBuilder::new(pipeline_id, layout_size);
+    let mut builder = DisplayListBuilder::new(pipeline_id);
     let mut txn = Transaction::new();
 
     example.render(
-        &api,
+        &mut api,
         &mut builder,
         &mut txn,
         device_size,
@@ -221,7 +214,7 @@ pub fn main_wrapper<E: Example>(
         true,
     );
     txn.set_root_pipeline(pipeline_id);
-    txn.generate_frame();
+    txn.generate_frame(0);
     api.send_transaction(document_id, txn);
 
     println!("Entering event loop");
@@ -236,9 +229,18 @@ pub fn main_wrapper<E: Example>(
         };
         match win_event {
             winit::WindowEvent::CloseRequested => return winit::ControlFlow::Break,
-            // skip high-frequency events
             winit::WindowEvent::AxisMotion { .. } |
-            winit::WindowEvent::CursorMoved { .. } => return winit::ControlFlow::Continue,
+            winit::WindowEvent::CursorMoved { .. } => {
+                custom_event = example.on_event(
+                        win_event,
+                        &mut api,
+                        document_id,
+                    );
+                // skip high-frequency events from triggering a frame draw.
+                if !custom_event {
+                    return winit::ControlFlow::Continue;
+                }
+            },
             winit::WindowEvent::KeyboardInput {
                 input: winit::KeyboardInput {
                     state: winit::ElementState::Pressed,
@@ -251,23 +253,11 @@ pub fn main_wrapper<E: Example>(
                 winit::VirtualKeyCode::P => debug_flags.toggle(DebugFlags::PROFILER_DBG),
                 winit::VirtualKeyCode::O => debug_flags.toggle(DebugFlags::RENDER_TARGET_DBG),
                 winit::VirtualKeyCode::I => debug_flags.toggle(DebugFlags::TEXTURE_CACHE_DBG),
-                winit::VirtualKeyCode::S => debug_flags.toggle(DebugFlags::COMPACT_PROFILER),
                 winit::VirtualKeyCode::T => debug_flags.toggle(DebugFlags::PICTURE_CACHING_DBG),
                 winit::VirtualKeyCode::Q => debug_flags.toggle(
                     DebugFlags::GPU_TIME_QUERIES | DebugFlags::GPU_SAMPLE_QUERIES
                 ),
-                winit::VirtualKeyCode::F => debug_flags.toggle(
-                    DebugFlags::NEW_FRAME_INDICATOR | DebugFlags::NEW_SCENE_INDICATOR
-                ),
                 winit::VirtualKeyCode::G => debug_flags.toggle(DebugFlags::GPU_CACHE_DBG),
-                winit::VirtualKeyCode::Key1 => txn.set_document_view(
-                    device_size.into(),
-                    1.0
-                ),
-                winit::VirtualKeyCode::Key2 => txn.set_document_view(
-                    device_size.into(),
-                    2.0
-                ),
                 winit::VirtualKeyCode::M => api.notify_memory_pressure(),
                 winit::VirtualKeyCode::C => {
                     let path: PathBuf = "../captures/example".into();
@@ -279,14 +269,14 @@ pub fn main_wrapper<E: Example>(
                 _ => {
                     custom_event = example.on_event(
                         win_event,
-                        &api,
+                        &mut api,
                         document_id,
                     )
                 },
             },
             other => custom_event = example.on_event(
                 other,
-                &api,
+                &mut api,
                 document_id,
             ),
         };
@@ -296,10 +286,10 @@ pub fn main_wrapper<E: Example>(
         }
 
         if custom_event {
-            let mut builder = DisplayListBuilder::new(pipeline_id, layout_size);
+            let mut builder = DisplayListBuilder::new(pipeline_id);
 
             example.render(
-                &api,
+                &mut api,
                 &mut builder,
                 &mut txn,
                 device_size,
@@ -313,12 +303,12 @@ pub fn main_wrapper<E: Example>(
                 builder.finalize(),
                 true,
             );
-            txn.generate_frame();
+            txn.generate_frame(0);
         }
         api.send_transaction(document_id, txn);
 
         renderer.update();
-        renderer.render(device_size).unwrap();
+        renderer.render(device_size, 0).unwrap();
         let _ = renderer.flush_pipeline_info();
         example.draw_custom(&*gl);
         windowed_context.swap_buffers().ok();

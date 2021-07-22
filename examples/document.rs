@@ -14,6 +14,7 @@ mod boilerplate;
 use crate::boilerplate::Example;
 use euclid::Scale;
 use webrender::api::*;
+use webrender::render_api::*;
 use webrender::api::units::*;
 
 // This example creates multiple documents overlapping each other with
@@ -33,52 +34,46 @@ struct App {
 impl App {
     fn init(
         &mut self,
-        api: &RenderApi,
+        api: &mut RenderApi,
         device_pixel_ratio: f32,
     ) {
         let init_data = vec![
             (
                 PipelineId(1, 0),
-                -2,
                 ColorF::new(0.0, 1.0, 0.0, 1.0),
                 DeviceIntPoint::new(0, 0),
             ),
             (
                 PipelineId(2, 0),
-                -1,
                 ColorF::new(1.0, 1.0, 0.0, 1.0),
                 DeviceIntPoint::new(200, 0),
             ),
             (
                 PipelineId(3, 0),
-                0,
                 ColorF::new(1.0, 0.0, 0.0, 1.0),
                 DeviceIntPoint::new(200, 200),
             ),
             (
                 PipelineId(4, 0),
-                1,
                 ColorF::new(1.0, 0.0, 1.0, 1.0),
                 DeviceIntPoint::new(0, 200),
             ),
         ];
 
-        for (pipeline_id, layer, color, offset) in init_data {
+        for (pipeline_id, color, offset) in init_data {
             let size = DeviceIntSize::new(250, 250);
-            let bounds = DeviceIntRect::new(offset, size);
+            let bounds = DeviceIntRect::from_origin_and_size(offset, size);
 
-            let document_id = api.add_document(size, layer);
+            let document_id = api.add_document(size);
             let mut txn = Transaction::new();
-            txn.set_document_view(bounds, device_pixel_ratio);
             txn.set_root_pipeline(pipeline_id);
             api.send_transaction(document_id, txn);
 
             self.documents.push(Document {
                 id: document_id,
                 pipeline_id,
-                content_rect: LayoutRect::new(
-                    LayoutPoint::origin(),
-                    bounds.size.to_f32() / Scale::new(device_pixel_ratio),
+                content_rect: LayoutRect::from_size(
+                    bounds.size().to_f32() / Scale::new(device_pixel_ratio),
                 ),
                 color,
             });
@@ -89,39 +84,34 @@ impl App {
 impl Example for App {
     fn render(
         &mut self,
-        api: &RenderApi,
-        base_builder: &mut DisplayListBuilder,
+        api: &mut RenderApi,
+        _base_builder: &mut DisplayListBuilder,
         _txn: &mut Transaction,
-        device_size: DeviceIntSize,
+        _device_size: DeviceIntSize,
         _pipeline_id: PipelineId,
         _: DocumentId,
     ) {
         if self.documents.is_empty() {
-            let device_pixel_ratio = device_size.width as f32 /
-                base_builder.content_size().width;
             // this is the first run, hack around the boilerplate,
             // which assumes an example only needs one document
-            self.init(api,  device_pixel_ratio);
+            self.init(api, 1.0);
         }
 
         for doc in &self.documents {
             let space_and_clip = SpaceAndClipInfo::root_scroll(doc.pipeline_id);
             let mut builder = DisplayListBuilder::new(
                 doc.pipeline_id,
-                doc.content_rect.size,
             );
-            let local_rect = LayoutRect::new(
-                LayoutPoint::zero(),
-                doc.content_rect.size,
-            );
+            let local_rect = LayoutRect::from_size(doc.content_rect.size());
 
             builder.push_simple_stacking_context(
-                doc.content_rect.origin,
+                doc.content_rect.min,
                 space_and_clip.spatial_id,
                 PrimitiveFlags::IS_BACKFACE_VISIBLE,
             );
             builder.push_rect(
                 &CommonItemProperties::new(local_rect, space_and_clip),
+                local_rect,
                 doc.color,
             );
             builder.pop_stacking_context();
@@ -130,11 +120,11 @@ impl Example for App {
             txn.set_display_list(
                 Epoch(0),
                 None,
-                doc.content_rect.size,
+                doc.content_rect.size(),
                 builder.finalize(),
                 true,
             );
-            txn.generate_frame();
+            txn.generate_frame(0);
             api.send_transaction(doc.id, txn);
         }
     }

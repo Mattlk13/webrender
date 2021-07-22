@@ -2,16 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use api::{BuiltDisplayList, ColorF, DynamicProperties, Epoch, FontRenderMode};
-use api::{PipelineId, PropertyBinding, PropertyBindingId, MixBlendMode, StackingContext};
+use api::{BuiltDisplayList, DisplayListWithCache, ColorF, DynamicProperties, Epoch, FontRenderMode};
+use api::{PipelineId, PropertyBinding, PropertyBindingId, PropertyValue, MixBlendMode, StackingContext};
 use api::units::*;
+use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use crate::render_api::MemoryReport;
 use crate::composite::CompositorKind;
-use crate::clip::{ClipStore, ClipDataStore};
-use crate::clip_scroll_tree::{ClipScrollTree, SpatialNodeIndex};
+use crate::clip::{ClipStore, ClipStoreStats};
+use crate::spatial_tree::SpatialTree;
 use crate::frame_builder::{ChasePrimitive, FrameBuilderConfig};
 use crate::hit_test::{HitTester, HitTestingScene, HitTestingSceneStats};
-use crate::internal_types::{FastHashMap, FastHashSet};
+use crate::internal_types::{FastHashMap, PlaneSplitter};
+use crate::picture_graph::PictureGraph;
 use crate::prim_store::{PrimitiveStore, PrimitiveStoreStats, PictureIndex};
+use crate::tile_cache::TileCacheConfig;
 use std::sync::Arc;
 
 /// Stores a map of the animated property bindings for the current display list. These
@@ -22,6 +26,7 @@ use std::sync::Arc;
 pub struct SceneProperties {
     transform_properties: FastHashMap<PropertyBindingId, LayoutTransform>,
     float_properties: FastHashMap<PropertyBindingId, f32>,
+    color_properties: FastHashMap<PropertyBindingId, ColorF>,
     current_properties: DynamicProperties,
     pending_properties: Option<DynamicProperties>,
 }
@@ -31,6 +36,7 @@ impl SceneProperties {
         SceneProperties {
             transform_properties: FastHashMap::default(),
             float_properties: FastHashMap::default(),
+            color_properties: FastHashMap::default(),
             current_properties: DynamicProperties::default(),
             pending_properties: None,
         }
@@ -42,13 +48,12 @@ impl SceneProperties {
     }
 
     /// Add to the current property list for this display list.
-    pub fn add_properties(&mut self, properties: DynamicProperties) {
+    pub fn add_transforms(&mut self, transforms: Vec<PropertyValue<LayoutTransform>>) {
         let mut pending_properties = self.pending_properties
             .take()
             .unwrap_or_default();
 
-        pending_properties.transforms.extend(properties.transforms);
-        pending_properties.floats.extend(properties.floats);
+        pending_properties.transforms.extend(transforms);
 
         self.pending_properties = Some(pending_properties);
     }
@@ -68,6 +73,7 @@ impl SceneProperties {
             if *pending_properties != self.current_properties {
                 self.transform_properties.clear();
                 self.float_properties.clear();
+                self.color_properties.clear();
 
                 for property in &pending_properties.transforms {
                     self.transform_properties
@@ -76,6 +82,11 @@ impl SceneProperties {
 
                 for property in &pending_properties.floats {
                     self.float_properties
+                        .insert(property.key.id, property.value);
+                }
+
+                for property in &pending_properties.colors {
+                    self.color_properties
                         .insert(property.key.id, property.value);
                 }
 
@@ -122,6 +133,27 @@ impl SceneProperties {
     pub fn float_properties(&self) -> &FastHashMap<PropertyBindingId, f32> {
         &self.float_properties
     }
+
+    /// Get the current value for a color property.
+    pub fn resolve_color(
+        &self,
+        property: &PropertyBinding<ColorF>
+    ) -> ColorF {
+        match *property {
+            PropertyBinding::Value(value) => value,
+            PropertyBinding::Binding(ref key, v) => {
+                self.color_properties
+                    .get(&key.id)
+                    .cloned()
+                    .unwrap_or(v)
+            }
+        }
+    }
+
+    pub fn color_properties(&self) -> &FastHashMap<PropertyBindingId, ColorF> {
+        &self.color_properties
+    }
+
 }
 
 /// A representation of the layout within the display port for a given document or iframe.
@@ -131,9 +163,8 @@ impl SceneProperties {
 pub struct ScenePipeline {
     pub pipeline_id: PipelineId,
     pub viewport_size: LayoutSize,
-    pub content_size: LayoutSize,
     pub background_color: Option<ColorF>,
-    pub display_list: BuiltDisplayList,
+    pub display_list: DisplayListWithCache,
 }
 
 /// A complete representation of the layout bundling visible pipelines together.
@@ -166,12 +197,20 @@ impl Scene {
         display_list: BuiltDisplayList,
         background_color: Option<ColorF>,
         viewport_size: LayoutSize,
-        content_size: LayoutSize,
     ) {
+        // Adds a cache to the given display list. If this pipeline already had
+        // a display list before, that display list is updated and used instead.
+        let display_list = match self.pipelines.remove(&pipeline_id) {
+            Some(mut pipeline) => {
+                pipeline.display_list.update(display_list);
+                pipeline.display_list
+            }
+            None => DisplayListWithCache::new_from_list(display_list)
+        };
+
         let new_pipeline = ScenePipeline {
             pipeline_id,
             viewport_size,
-            content_size,
             background_color,
             display_list,
         };
@@ -199,6 +238,16 @@ impl Scene {
 
         false
     }
+
+    pub fn report_memory(
+        &self,
+        ops: &mut MallocSizeOfOps,
+        report: &mut MemoryReport
+    ) {
+        for (_, pipeline) in &self.pipelines {
+            report.display_list += pipeline.display_list.size_of(ops)
+        }
+    }
 }
 
 pub trait StackingContextHelpers {
@@ -221,14 +270,15 @@ pub struct BuiltScene {
     pub pipeline_epochs: FastHashMap<PipelineId, Epoch>,
     pub output_rect: DeviceIntRect,
     pub background_color: Option<ColorF>,
-    pub root_pic_index: PictureIndex,
     pub prim_store: PrimitiveStore,
     pub clip_store: ClipStore,
     pub config: FrameBuilderConfig,
-    pub clip_scroll_tree: ClipScrollTree,
+    pub spatial_tree: SpatialTree,
     pub hit_testing_scene: Arc<HitTestingScene>,
-    pub content_slice_count: usize,
-    pub picture_cache_spatial_nodes: FastHashSet<SpatialNodeIndex>,
+    pub tile_cache_config: TileCacheConfig,
+    pub tile_cache_pictures: Vec<PictureIndex>,
+    pub picture_graph: PictureGraph,
+    pub plane_splitters: Vec<PlaneSplitter>,
 }
 
 impl BuiltScene {
@@ -238,26 +288,34 @@ impl BuiltScene {
             pipeline_epochs: FastHashMap::default(),
             output_rect: DeviceIntRect::zero(),
             background_color: None,
-            root_pic_index: PictureIndex(0),
             prim_store: PrimitiveStore::new(&PrimitiveStoreStats::empty()),
-            clip_store: ClipStore::new(),
-            clip_scroll_tree: ClipScrollTree::new(),
+            clip_store: ClipStore::new(&ClipStoreStats::empty()),
+            spatial_tree: SpatialTree::new(),
             hit_testing_scene: Arc::new(HitTestingScene::new(&HitTestingSceneStats::empty())),
-            content_slice_count: 0,
-            picture_cache_spatial_nodes: FastHashSet::default(),
+            tile_cache_config: TileCacheConfig::new(0),
+            tile_cache_pictures: Vec::new(),
+            picture_graph: PictureGraph::new(),
+            plane_splitters: Vec::new(),
             config: FrameBuilderConfig {
                 default_font_render_mode: FontRenderMode::Mono,
                 dual_source_blending_is_enabled: true,
                 dual_source_blending_is_supported: false,
                 chase_primitive: ChasePrimitive::Nothing,
-                global_enable_picture_caching: false,
                 testing: false,
                 gpu_supports_fast_clears: false,
                 gpu_supports_advanced_blend: false,
                 advanced_blend_is_coherent: false,
+                gpu_supports_render_target_partial_update: true,
+                external_images_require_copy: false,
                 batch_lookback_count: 0,
                 background_color: None,
                 compositor_kind: CompositorKind::default(),
+                tile_size_override: None,
+                max_depth_ids: 0,
+                max_target_size: 0,
+                force_invalidation: false,
+                is_software: false,
+                low_quality_pinch_zoom: false,
             },
         }
     }
@@ -267,18 +325,14 @@ impl BuiltScene {
         SceneStats {
             prim_store_stats: self.prim_store.get_stats(),
             hit_test_stats: self.hit_testing_scene.get_stats(),
+            clip_store_stats: self.clip_store.get_stats(),
         }
     }
 
-    pub fn create_hit_tester(
-        &mut self,
-        clip_data_store: &ClipDataStore,
-    ) -> HitTester {
+    pub fn create_hit_tester(&mut self) -> HitTester {
         HitTester::new(
             Arc::clone(&self.hit_testing_scene),
-            &self.clip_scroll_tree,
-            &self.clip_store,
-            clip_data_store,
+            &self.spatial_tree,
         )
     }
 }
@@ -290,6 +344,7 @@ impl BuiltScene {
 pub struct SceneStats {
     pub prim_store_stats: PrimitiveStoreStats,
     pub hit_test_stats: HitTestingSceneStats,
+    pub clip_store_stats: ClipStoreStats,
 }
 
 impl SceneStats {
@@ -297,6 +352,7 @@ impl SceneStats {
         SceneStats {
             prim_store_stats: PrimitiveStoreStats::empty(),
             hit_test_stats: HitTestingSceneStats::empty(),
+            clip_store_stats: ClipStoreStats::empty(),
         }
     }
 }
