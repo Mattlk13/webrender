@@ -6,13 +6,13 @@ use api::{CompositeOperator, FilterPrimitive, FilterPrimitiveInput, FilterPrimit
 use api::{LineStyle, LineOrientation, ClipMode, MixBlendMode, ColorF, ColorSpace};
 use api::MAX_RENDER_TASK_SIZE;
 use api::units::*;
-use crate::batch::CommandBufferIndex;
 use crate::clip::{ClipDataStore, ClipItemKind, ClipStore, ClipNodeRange};
+use crate::command_buffer::{CommandBufferIndex, QuadFlags};
 use crate::spatial_tree::SpatialNodeIndex;
 use crate::filterdata::SFilterData;
-use crate::frame_builder::{FrameBuilderConfig};
+use crate::frame_builder::FrameBuilderConfig;
 use crate::gpu_cache::{GpuCache, GpuCacheAddress, GpuCacheHandle};
-use crate::gpu_types::{BorderInstance, ImageSource, UvRectKind};
+use crate::gpu_types::{BorderInstance, ImageSource, UvRectKind, TransformPaletteId};
 use crate::internal_types::{CacheTextureId, FastHashMap, TextureSource, Swizzle};
 use crate::picture::ResolvedSurfaceTexture;
 use crate::prim_store::ClipData;
@@ -22,9 +22,11 @@ use crate::prim_store::gradient::{
 };
 use crate::resource_cache::{ResourceCache, ImageRequest};
 use std::{usize, f32, i32, u32};
+use crate::renderer::{GpuBufferAddress, GpuBufferBuilderF};
 use crate::render_target::{ResolveOp, RenderTargetKind};
 use crate::render_task_graph::{PassId, RenderTaskId, RenderTaskGraphBuilder};
 use crate::render_task_cache::{RenderTaskCacheEntryHandle, RenderTaskCacheKey, RenderTaskCacheKeyKind, RenderTaskParent};
+use crate::segment::EdgeAaSegmentMask;
 use crate::surface::SurfaceBuilder;
 use smallvec::SmallVec;
 
@@ -44,11 +46,11 @@ fn render_task_sanity_check(size: &DeviceIntSize) {
 #[repr(C)]
 #[cfg_attr(feature = "capture", derive(Serialize))]
 #[cfg_attr(feature = "replay", derive(Deserialize))]
-pub struct RenderTaskAddress(pub u16);
+pub struct RenderTaskAddress(pub i32);
 
 impl Into<RenderTaskAddress> for RenderTaskId {
     fn into(self) -> RenderTaskAddress {
-        RenderTaskAddress(self.index as u16)
+        RenderTaskAddress(self.index as i32)
     }
 }
 
@@ -173,6 +175,29 @@ pub struct ClipRegionTask {
 
 #[cfg_attr(feature = "capture", derive(Serialize))]
 #[cfg_attr(feature = "replay", derive(Deserialize))]
+pub struct EmptyTask {
+    pub content_origin: DevicePoint,
+    pub device_pixel_scale: DevicePixelScale,
+    pub raster_spatial_node_index: SpatialNodeIndex,
+}
+
+#[cfg_attr(feature = "capture", derive(Serialize))]
+#[cfg_attr(feature = "replay", derive(Deserialize))]
+pub struct PrimTask {
+    pub device_pixel_scale: DevicePixelScale,
+    pub content_origin: DevicePoint,
+    pub prim_address_f: GpuBufferAddress,
+    pub prim_spatial_node_index: SpatialNodeIndex,
+    pub raster_spatial_node_index: SpatialNodeIndex,
+    pub transform_id: TransformPaletteId,
+    pub edge_flags: EdgeAaSegmentMask,
+    pub quad_flags: QuadFlags,
+    pub clip_node_range: ClipNodeRange,
+    pub prim_needs_scissor_rect: bool,
+}
+
+#[cfg_attr(feature = "capture", derive(Serialize))]
+#[cfg_attr(feature = "replay", derive(Deserialize))]
 pub struct TileCompositeTask {
     pub clear_color: ColorF,
     pub scissor_rect: DeviceIntRect,
@@ -232,7 +257,7 @@ impl BlurTask {
     // In order to do the blur down-scaling passes without introducing errors, we need the
     // source of each down-scale pass to be a multuple of two. If need be, this inflates
     // the source size so that each down-scale pass will sample correctly.
-    pub fn adjusted_blur_source_size(original_size: DeviceSize, mut std_dev: DeviceSize) -> DeviceSize {
+    pub fn adjusted_blur_source_size(original_size: DeviceSize, mut std_dev: DeviceSize) -> DeviceIntSize {
         let mut adjusted_size = original_size;
         let mut scale_factor = 1.0;
         while std_dev.width > MAX_BLUR_STD_DEVIATION && std_dev.height > MAX_BLUR_STD_DEVIATION {
@@ -245,7 +270,7 @@ impl BlurTask {
             adjusted_size = (original_size.to_f32() / scale_factor).ceil();
         }
 
-        adjusted_size * scale_factor
+        (adjusted_size * scale_factor).round().to_i32()
     }
 }
 
@@ -345,6 +370,8 @@ pub enum RenderTaskKind {
     ConicGradient(ConicGradientTask),
     SvgFilter(SvgFilterTask),
     TileComposite(TileCompositeTask),
+    Prim(PrimTask),
+    Empty(EmptyTask),
     #[cfg(test)]
     Test(RenderTargetKind),
 }
@@ -394,6 +421,8 @@ impl RenderTaskKind {
             RenderTaskKind::ConicGradient(..) => "ConicGradient",
             RenderTaskKind::SvgFilter(..) => "SvgFilter",
             RenderTaskKind::TileComposite(..) => "TileComposite",
+            RenderTaskKind::Prim(..) => "Prim",
+            RenderTaskKind::Empty(..) => "Empty",
             #[cfg(test)]
             RenderTaskKind::Test(..) => "Test",
         }
@@ -412,12 +441,14 @@ impl RenderTaskKind {
             RenderTaskKind::Picture(..) |
             RenderTaskKind::Blit(..) |
             RenderTaskKind::TileComposite(..) |
+            RenderTaskKind::Prim(..) |
             RenderTaskKind::SvgFilter(..) => {
                 RenderTargetKind::Color
             }
 
             RenderTaskKind::ClipRegion(..) |
-            RenderTaskKind::CacheMask(..) => {
+            RenderTaskKind::CacheMask(..) |
+            RenderTaskKind::Empty(..) => {
                 RenderTargetKind::Alpha
             }
 
@@ -484,6 +515,32 @@ impl RenderTaskKind {
         })
     }
 
+    pub fn new_prim(
+        prim_spatial_node_index: SpatialNodeIndex,
+        raster_spatial_node_index: SpatialNodeIndex,
+        device_pixel_scale: DevicePixelScale,
+        content_origin: DevicePoint,
+        prim_address_f: GpuBufferAddress,
+        transform_id: TransformPaletteId,
+        edge_flags: EdgeAaSegmentMask,
+        quad_flags: QuadFlags,
+        clip_node_range: ClipNodeRange,
+        prim_needs_scissor_rect: bool,
+    ) -> Self {
+        RenderTaskKind::Prim(PrimTask {
+            prim_spatial_node_index,
+            raster_spatial_node_index,
+            device_pixel_scale,
+            content_origin,
+            prim_address_f,
+            transform_id,
+            edge_flags,
+            quad_flags,
+            clip_node_range,
+            prim_needs_scissor_rect,
+        })
+    }
+
     pub fn new_readback(
         readback_origin: Option<DevicePoint>,
     ) -> Self {
@@ -536,6 +593,7 @@ impl RenderTaskKind {
         root_spatial_node_index: SpatialNodeIndex,
         clip_store: &mut ClipStore,
         gpu_cache: &mut GpuCache,
+        gpu_buffer_builder: &mut GpuBufferBuilderF,
         resource_cache: &mut ResourceCache,
         rg_builder: &mut RenderTaskGraphBuilder,
         clip_data_store: &mut ClipDataStore,
@@ -591,12 +649,13 @@ impl RenderTaskKind {
                             kind: RenderTaskCacheKeyKind::BoxShadow(cache_key),
                         },
                         gpu_cache,
+                        gpu_buffer_builder,
                         rg_builder,
                         None,
                         false,
                         RenderTaskParent::RenderTask(clip_task_id),
                         surface_builder,
-                        |rg_builder| {
+                        |rg_builder, _| {
                             let clip_data = ClipData::rounded_rect(
                                 source.minimal_shadow_rect.size(),
                                 &source.shadow_radius,
@@ -654,6 +713,24 @@ impl RenderTaskKind {
             RenderTaskKind::Picture(ref task) => {
                 // Note: has to match `PICTURE_TYPE_*` in shaders
                 [
+                    task.device_pixel_scale.0,
+                    task.content_origin.x,
+                    task.content_origin.y,
+                    0.0,
+                ]
+            }
+            RenderTaskKind::Prim(ref task) => {
+                [
+                    // NOTE: This must match the render task data format for Picture tasks currently
+                    task.device_pixel_scale.0,
+                    task.content_origin.x,
+                    task.content_origin.y,
+                    0.0,
+                ]
+            }
+            RenderTaskKind::Empty(ref task) => {
+                [
+                    // NOTE: This must match the render task data format for Picture tasks currently
                     task.device_pixel_scale.0,
                     task.content_origin.x,
                     task.content_origin.y,
@@ -803,10 +880,27 @@ pub type TaskDependencies = SmallVec<[RenderTaskId;2]>;
 
 #[cfg_attr(feature = "capture", derive(Serialize))]
 #[cfg_attr(feature = "replay", derive(Deserialize))]
+pub struct MaskSubPass {
+    pub clip_node_range: ClipNodeRange,
+    pub prim_spatial_node_index: SpatialNodeIndex,
+    pub prim_address_f: GpuBufferAddress,
+}
+
+#[cfg_attr(feature = "capture", derive(Serialize))]
+#[cfg_attr(feature = "replay", derive(Deserialize))]
+pub enum SubPass {
+    Masks {
+        masks: MaskSubPass,
+    },
+}
+
+#[cfg_attr(feature = "capture", derive(Serialize))]
+#[cfg_attr(feature = "replay", derive(Deserialize))]
 pub struct RenderTask {
     pub location: RenderTaskLocation,
     pub children: TaskDependencies,
     pub kind: RenderTaskKind,
+    pub sub_pass: Option<SubPass>,
 
     // TODO(gw): These fields and perhaps others can become private once the
     //           frame_graph / render_task source files are unified / cleaned up.
@@ -838,6 +932,7 @@ impl RenderTask {
             uv_rect_handle: GpuCacheHandle::new(),
             uv_rect_kind: UvRectKind::Rect,
             cache_handle: None,
+            sub_pass: None,
         }
     }
 
@@ -845,6 +940,9 @@ impl RenderTask {
         size: DeviceIntSize,
         kind: RenderTaskKind,
     ) -> Self {
+        if size.is_empty() {
+            log::warn!("Bad {} render task size: {:?}", kind.as_str(), size);
+        }
         RenderTask::new(
             RenderTaskLocation::Unallocated { size },
             kind,
@@ -877,6 +975,7 @@ impl RenderTask {
             uv_rect_handle: GpuCacheHandle::new(),
             uv_rect_kind: UvRectKind::Rect,
             cache_handle: None,
+            sub_pass: None,
         }
     }
 
@@ -895,6 +994,7 @@ impl RenderTask {
             uv_rect_handle: GpuCacheHandle::new(),
             uv_rect_kind: UvRectKind::Rect,
             cache_handle: None,
+            sub_pass: None,
         }
     }
 
@@ -1395,6 +1495,14 @@ impl RenderTask {
         }
 
         task_id
+    }
+
+    pub fn add_sub_pass(
+        &mut self,
+        sub_pass: SubPass,
+    ) {
+        assert!(self.sub_pass.is_none(), "multiple sub-passes are not supported for now");
+        self.sub_pass = Some(sub_pass);
     }
 
     pub fn uv_rect_kind(&self) -> UvRectKind {

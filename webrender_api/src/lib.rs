@@ -163,6 +163,35 @@ impl PipelineId {
     pub const INVALID: Self = PipelineId(!0, !0);
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct FramePublishId(pub u64);
+
+impl FramePublishId {
+    /// Returns a FramePublishId corresponding to the first frame.
+    ///
+    /// Note that we use 0 as the internal id here because the current code
+    /// increments the frame publish id just before ResultMsg::PublishDocument,
+    /// and we want the first id to be 1.
+    pub fn first() -> Self {
+        FramePublishId(0)
+    }
+
+    /// Advances this FramePublishId to the next.
+    pub fn advance(&mut self) {
+        self.0 += 1;
+    }
+
+    /// An invalid sentinel FramePublishId, which will always compare less than
+    /// any valid FrameId.
+    pub const INVALID: Self = FramePublishId(0);
+}
+
+impl Default for FramePublishId {
+    fn default() -> Self {
+        FramePublishId::INVALID
+    }
+}
 
 /// An opaque pointer-sized value.
 #[repr(C)]
@@ -209,6 +238,23 @@ impl Default for HasScrollLinkedEffect {
     }
 }
 
+#[repr(C)]
+pub struct MinimapData {
+  pub is_root_content: bool,
+  // All rects in local coords relative to the scrolled content's origin.
+  pub visual_viewport: LayoutRect,
+  pub layout_viewport: LayoutRect,
+  pub scrollable_rect: LayoutRect,
+  pub displayport: LayoutRect,
+  // Populated for root content nodes only, otherwise the identity
+  pub zoom_transform: LayoutTransform,
+  // Populated for nodes in the subtree of a root content node
+  // (outside such subtrees we'll have `root_content_scroll_id == 0`).
+  // Stores the enclosing root content node's ExternalScrollId.
+  pub root_content_pipeline_id: PipelineId,
+  pub root_content_scroll_id: u64
+}
+
 /// A handler to integrate WebRender with the thread that contains the `Renderer`.
 pub trait RenderNotifier: Send {
     ///
@@ -220,7 +266,7 @@ pub trait RenderNotifier: Send {
         composite_needed: bool,
     );
     /// Notify the thread containing the `Renderer` that a new frame is ready.
-    fn new_frame_ready(&self, _: DocumentId, scrolled: bool, composite_needed: bool);
+    fn new_frame_ready(&self, _: DocumentId, scrolled: bool, composite_needed: bool, frame_publish_id: FramePublishId);
     /// A Gecko-specific notification mechanism to get some code executed on the
     /// `Renderer`'s thread, mostly replaced by `NotificationHandler`. You should
     /// probably use the latter instead.
@@ -547,11 +593,13 @@ pub enum IntParameter {
     BatchedUploadThreshold = 0,
 }
 
+/// Flags to track why we are rendering.
+#[repr(C)]
+#[derive(Copy, PartialEq, Eq, Clone, PartialOrd, Ord, Hash, Default, Deserialize, MallocSizeOf, Serialize)]
+pub struct RenderReasons(u32);
+
 bitflags! {
-    /// Flags to track why we are rendering.
-    #[repr(C)]
-    #[derive(Default, Deserialize, MallocSizeOf, Serialize)]
-    pub struct RenderReasons: u32 {
+    impl RenderReasons: u32 {
         /// Equivalent of empty() for the C++ side.
         const NONE                          = 0;
         const SCENE                         = 1 << 0;
@@ -585,15 +633,27 @@ bitflags! {
     }
 }
 
+impl core::fmt::Debug for RenderReasons {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        if self.is_empty() {
+            write!(f, "{:#x}", Self::empty().bits())
+        } else {
+            bitflags::parser::to_writer(self, f)
+        }
+    }
+}
+
 impl RenderReasons {
     pub const NUM_BITS: u32 = 17;
 }
 
+/// Flags to enable/disable various builtin debugging tools.
+#[repr(C)]
+#[derive(Copy, PartialEq, Eq, Clone, PartialOrd, Ord, Hash, Default, Deserialize, MallocSizeOf, Serialize)]
+pub struct DebugFlags(u32);
+
 bitflags! {
-    /// Flags to enable/disable various builtin debugging tools.
-    #[repr(C)]
-    #[derive(Default, Deserialize, MallocSizeOf, Serialize)]
-    pub struct DebugFlags: u32 {
+    impl DebugFlags: u32 {
         /// Display the frame profiler on screen.
         const PROFILER_DBG          = 1 << 0;
         /// Display intermediate render targets on screen.
@@ -657,6 +717,19 @@ bitflags! {
         const FORCE_PICTURE_INVALIDATION = (1 as u32) << 26;
         /// Display window visibility on screen.
         const WINDOW_VISIBILITY_DBG     = 1 << 27;
+        /// Render large blobs with at a smaller size (incorrectly). This is a temporary workaround for
+        /// fuzzing.
+        const RESTRICT_BLOB_SIZE        = 1 << 28;
+    }
+}
+
+impl core::fmt::Debug for DebugFlags {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        if self.is_empty() {
+            write!(f, "{:#x}", Self::empty().bits())
+        } else {
+            bitflags::parser::to_writer(self, f)
+        }
     }
 }
 

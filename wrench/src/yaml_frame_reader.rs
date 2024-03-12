@@ -153,7 +153,6 @@ impl ExternalImageHandler for LocalExternalImageHandler {
         &mut self,
         key: ExternalImageId,
         _channel_index: u8,
-        _rendering: ImageRendering,
     ) -> ExternalImage {
         let (id, desc) = self.texture_ids[key.0 as usize];
         ExternalImage {
@@ -330,13 +329,14 @@ pub struct YamlFrameReader {
     image_map: HashMap<(PathBuf, Option<i64>), (ImageKey, LayoutSize)>,
 
     fonts: HashMap<FontDescriptor, FontKey>,
-    font_instances: HashMap<(FontKey, FontSize, FontInstanceFlags, Option<ColorU>, SyntheticItalics), FontInstanceKey>,
+    font_instances: HashMap<(FontKey, FontSize, FontInstanceFlags, SyntheticItalics), FontInstanceKey>,
     font_render_mode: Option<FontRenderMode>,
     allow_mipmaps: bool,
 
     /// A HashMap that allows specifying a numeric id for clip and clip chains in YAML
     /// and having each of those ids correspond to a unique ClipId.
     user_clip_id_map: HashMap<u64, ClipId>,
+    user_clipchain_id_map: HashMap<u64, ClipChainId>,
     user_spatial_id_map: HashMap<u64, SpatialId>,
 
     spatial_id_stack: Vec<SpatialId>,
@@ -368,6 +368,7 @@ impl YamlFrameReader {
             allow_mipmaps: false,
             image_map: HashMap::new(),
             user_clip_id_map: HashMap::new(),
+            user_clipchain_id_map: HashMap::new(),
             user_spatial_id_map: HashMap::new(),
             spatial_id_stack: Vec::new(),
             yaml_string: String::new(),
@@ -461,6 +462,7 @@ impl YamlFrameReader {
     ) {
         // Don't allow referencing clips between pipelines for now.
         self.user_clip_id_map.clear();
+        self.user_clipchain_id_map.clear();
         self.user_spatial_id_map.clear();
         self.spatial_id_stack.clear();
         self.spatial_id_stack.push(SpatialId::root_scroll_node(pipeline_id));
@@ -479,15 +481,6 @@ impl YamlFrameReader {
         assert_eq!(self.spatial_id_stack.len(), 1);
     }
 
-    fn to_clip_id(&self, item: &Yaml, pipeline_id: PipelineId) -> Option<ClipId> {
-        match *item {
-            Yaml::Integer(value) => Some(self.user_clip_id_map[&(value as u64)]),
-            Yaml::String(ref id_string) if id_string == "root_clip" =>
-                Some(ClipId::root(pipeline_id)),
-            _ => None,
-        }
-    }
-
     fn to_clip_chain_id(
         &self,
         item: &Yaml,
@@ -495,11 +488,7 @@ impl YamlFrameReader {
     ) -> Option<ClipChainId> {
         match *item {
             Yaml::Integer(value) => {
-                let clip_id = self.user_clip_id_map[&(value as u64)];
-                match clip_id {
-                    ClipId::ClipChain(id) => Some(id),
-                    ClipId::Clip(..) => panic!("bug: must be a valid clip-chain id"),
-                }
+                Some(self.user_clipchain_id_map[&(value as u64)])
             }
             Yaml::Array(ref array) => {
                 let clip_ids: Vec<ClipId> = array
@@ -534,6 +523,11 @@ impl YamlFrameReader {
     fn add_clip_id_mapping(&mut self, numeric_id: u64, real_id: ClipId) {
         assert_ne!(numeric_id, 0, "id=0 is reserved for the root clip");
         self.user_clip_id_map.insert(numeric_id, real_id);
+    }
+
+    fn add_clip_chain_id_mapping(&mut self, numeric_id: u64, real_id: ClipChainId) {
+        assert_ne!(numeric_id, 0, "id=0 is reserved for the root clip-chain");
+        self.user_clipchain_id_map.insert(numeric_id, real_id);
     }
 
     fn add_spatial_id_mapping(&mut self, numeric_id: u64, real_id: SpatialId) {
@@ -751,7 +745,6 @@ impl YamlFrameReader {
         &mut self,
         font_key: FontKey,
         size: f32,
-        bg_color: Option<ColorU>,
         flags: FontInstanceFlags,
         synthetic_italics: SyntheticItalics,
         wrench: &mut Wrench,
@@ -759,14 +752,13 @@ impl YamlFrameReader {
         let font_render_mode = self.font_render_mode;
 
         *self.font_instances
-            .entry((font_key, size.into(), flags, bg_color, synthetic_italics))
+            .entry((font_key, size.into(), flags, synthetic_italics))
             .or_insert_with(|| {
                 wrench.add_font_instance(
                     font_key,
                     size,
                     flags,
                     font_render_mode,
-                    bg_color,
                     synthetic_italics,
                 )
             })
@@ -793,11 +785,9 @@ impl YamlFrameReader {
         let image_rect = item["rect"]
             .as_rect()
             .unwrap_or_else(|| LayoutRect::from_size(image_dims));
-        let image_repeat = item["repeat"].as_bool().expect("Expected boolean");
         Some(ImageMask {
             image: image_key,
             rect: image_rect,
-            repeat: image_repeat,
         })
     }
 
@@ -1090,10 +1080,6 @@ impl YamlFrameReader {
                         vec![widths.top as u32, widths.left as u32, widths.bottom as u32, widths.right as u32]
                     };
 
-                    let outset = item["outset"]
-                        .as_vec_f32()
-                        .expect("border must have outset");
-                    let outset = broadcast(&outset, 4);
                     let repeat_horizontal = match item["repeat-horizontal"]
                         .as_str()
                         .unwrap_or("stretch")
@@ -1144,7 +1130,6 @@ impl YamlFrameReader {
                         fill,
                         repeat_horizontal,
                         repeat_vertical,
-                        outset: SideOffsets2D::new(outset[0], outset[1], outset[2], outset[3]),
                     }))
                 }
                 _ => {
@@ -1363,7 +1348,6 @@ impl YamlFrameReader {
     ) {
         let size = item["size"].as_pt_to_f32().unwrap_or(16.0);
         let color = item["color"].as_colorf().unwrap_or(ColorF::BLACK);
-        let bg_color = item["bg-color"].as_colorf().map(|c| c.into());
         let synthetic_italics = if let Some(angle) = item["synthetic-italics"].as_f32() {
             SyntheticItalics::from_degrees(angle)
         } else if item["synthetic-italics"].as_bool().unwrap_or(false) {
@@ -1398,7 +1382,6 @@ impl YamlFrameReader {
         let font_key = self.get_or_create_font(desc, wrench);
         let font_instance_key = self.get_or_create_font_instance(font_key,
                                                                  size,
-                                                                 bg_color,
                                                                  flags,
                                                                  synthetic_italics,
                                                                  wrench);
@@ -1583,6 +1566,7 @@ impl YamlFrameReader {
                     self.add_stacking_context_from_yaml(dl, wrench, item, IsRoot(false), &mut info)
                 }
                 "reference-frame" => self.handle_reference_frame(dl, wrench, item),
+                "computed-frame" => self.handle_computed_frame(dl, wrench, item),
                 "shadow" => self.handle_push_shadow(dl, item, &mut info),
                 "pop-all-shadows" => self.handle_pop_all_shadows(dl),
                 "backdrop-filter" => self.handle_backdrop_filter(dl, item, &mut info),
@@ -1792,15 +1776,9 @@ impl YamlFrameReader {
             .map(|id| self.user_clip_id_map[id])
             .collect();
 
-        let parent = self.to_clip_id(&yaml["parent"], builder.pipeline_id);
-        let parent = match parent {
-            Some(ClipId::ClipChain(clip_chain_id)) => Some(clip_chain_id),
-            Some(_) => panic!("Tried to create a ClipChain with a non-ClipChain parent"),
-            None => None,
-        };
-
+        let parent = self.to_clip_chain_id(&yaml["parent"], builder);
         let real_id = builder.define_clip_chain(parent, clip_ids);
-        self.add_clip_id_mapping(numeric_id as u64, ClipId::ClipChain(real_id));
+        self.add_clip_chain_id_mapping(numeric_id as u64, real_id);
     }
 
     fn handle_clip(&mut self, dl: &mut DisplayListBuilder, wrench: &mut Wrench, yaml: &Yaml) {
@@ -1921,6 +1899,53 @@ impl YamlFrameReader {
     ) {
         let default_bounds = || LayoutRect::from_size(wrench.window_size_f32());
         let real_id = self.push_reference_frame(dl, default_bounds, yaml);
+        self.spatial_id_stack.push(real_id);
+
+        if let Some(yaml_items) = yaml["items"].as_vec() {
+            self.add_display_list_items_from_yaml(dl, wrench, yaml_items);
+        }
+
+        self.spatial_id_stack.pop().unwrap();
+        dl.pop_reference_frame();
+    }
+
+    fn push_computed_frame(
+        &mut self,
+        dl: &mut DisplayListBuilder,
+        default_bounds: impl Fn() -> LayoutRect,
+        yaml: &Yaml,
+    ) -> SpatialId {
+        let bounds = yaml["bounds"].as_rect().unwrap_or_else(default_bounds);
+
+        let scale_from = yaml["scale-from"].as_size();
+        let vertical_flip = yaml["vertical-flip"].as_bool().unwrap_or(false);
+        let rotation = yaml["rotation"].as_rotation().unwrap_or(Rotation::Degree0);
+
+        let reference_frame_id = dl.push_computed_frame(
+            bounds.min,
+            *self.spatial_id_stack.last().unwrap(),
+            scale_from,
+            vertical_flip,
+            rotation,
+            self.next_spatial_key(),
+        );
+
+        let numeric_id = yaml["id"].as_i64();
+        if let Some(numeric_id) = numeric_id {
+            self.add_spatial_id_mapping(numeric_id as u64, reference_frame_id);
+        }
+
+        reference_frame_id
+    }
+
+    fn handle_computed_frame(
+        &mut self,
+        dl: &mut DisplayListBuilder,
+        wrench: &mut Wrench,
+        yaml: &Yaml,
+    ) {
+        let default_bounds = || LayoutRect::from_size(wrench.window_size_f32());
+        let real_id = self.push_computed_frame(dl, default_bounds, yaml);
         self.spatial_id_stack.push(real_id);
 
         if let Some(yaml_items) = yaml["items"].as_vec() {

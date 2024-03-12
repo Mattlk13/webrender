@@ -3,29 +3,34 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 
-use api::units::*;
+use api::{units::*, PremultipliedColorF, ClipMode};
 use api::{ColorF, ImageFormat, LineOrientation, BorderStyle};
-use crate::batch::{AlphaBatchBuilder, AlphaBatchContainer, BatchTextures};
-use crate::batch::{ClipBatcher, BatchBuilder, CommandBufferList};
+use crate::batch::{AlphaBatchBuilder, AlphaBatchContainer, BatchTextures, add_quad_to_batch};
+use crate::batch::{ClipBatcher, BatchBuilder, INVALID_SEGMENT_INDEX, ClipMaskInstanceList};
+use crate::command_buffer::{CommandBufferList, QuadFlags};
+use crate::segment::EdgeAaSegmentMask;
 use crate::spatial_tree::SpatialTree;
-use crate::clip::ClipStore;
+use crate::clip::{ClipStore, ClipItemKind};
 use crate::frame_builder::{FrameGlobalResources};
 use crate::gpu_cache::{GpuCache, GpuCacheAddress};
 use crate::gpu_types::{BorderInstance, SvgFilterInstance, BlurDirection, BlurInstance, PrimitiveHeaders, ScalingInstance};
-use crate::gpu_types::{TransformPalette, ZBufferIdGenerator};
+use crate::gpu_types::{TransformPalette, ZBufferIdGenerator, MaskInstance, ClipSpace};
+use crate::gpu_types::{ZBufferId, QuadSegment, PrimitiveInstanceData, TransformPaletteId};
 use crate::internal_types::{FastHashMap, TextureSource, CacheTextureId};
 use crate::picture::{SliceId, SurfaceInfo, ResolvedSurfaceTexture, TileCacheInstance};
+use crate::prepare::write_prim_blocks;
 use crate::prim_store::{PrimitiveInstance, PrimitiveStore, PrimitiveScratchBuffer};
 use crate::prim_store::gradient::{
     FastLinearGradientInstance, LinearGradientInstance, RadialGradientInstance,
     ConicGradientInstance,
 };
+use crate::renderer::{GpuBufferAddress, GpuBufferBuilder};
 use crate::render_backend::DataStores;
-use crate::render_task::{RenderTaskKind, RenderTaskAddress};
-use crate::render_task::{RenderTask, ScalingTask, SvgFilterInfo};
+use crate::render_task::{RenderTaskKind, RenderTaskAddress, SubPass};
+use crate::render_task::{RenderTask, ScalingTask, SvgFilterInfo, MaskSubPass};
 use crate::render_task_graph::{RenderTaskGraph, RenderTaskId};
 use crate::resource_cache::ResourceCache;
-use crate::spatial_tree::SpatialNodeIndex;
+use crate::spatial_tree::{SpatialNodeIndex};
 
 
 const STYLE_SOLID: i32 = ((BorderStyle::Solid as i32) << 8) | ((BorderStyle::Solid as i32) << 16);
@@ -49,6 +54,7 @@ pub struct RenderTargetIndex(pub usize);
 pub struct RenderTargetContext<'a, 'rc> {
     pub global_device_pixel_scale: DevicePixelScale,
     pub prim_store: &'a PrimitiveStore,
+    pub clip_store: &'a ClipStore,
     pub resource_cache: &'rc mut ResourceCache,
     pub use_dual_source_blending: bool,
     pub use_advanced_blending: bool,
@@ -98,6 +104,7 @@ pub trait RenderTarget {
         _z_generator: &mut ZBufferIdGenerator,
         _prim_instances: &[PrimitiveInstance],
         _cmd_buffers: &CommandBufferList,
+        _gpu_buffer_builder: &mut GpuBufferBuilder,
     ) {
     }
 
@@ -115,6 +122,7 @@ pub trait RenderTarget {
         task_id: RenderTaskId,
         ctx: &RenderTargetContext,
         gpu_cache: &mut GpuCache,
+        gpu_buffer_builder: &mut GpuBufferBuilder,
         render_tasks: &RenderTaskGraph,
         clip_store: &ClipStore,
         transforms: &mut TransformPalette,
@@ -176,6 +184,7 @@ impl<T: RenderTarget> RenderTargetList<T> {
         z_generator: &mut ZBufferIdGenerator,
         prim_instances: &[PrimitiveInstance],
         cmd_buffers: &CommandBufferList,
+        gpu_buffer_builder: &mut GpuBufferBuilder,
     ) {
         if self.targets.is_empty() {
             return;
@@ -191,6 +200,7 @@ impl<T: RenderTarget> RenderTargetList<T> {
                 z_generator,
                 prim_instances,
                 cmd_buffers,
+                gpu_buffer_builder,
             );
         }
     }
@@ -224,6 +234,11 @@ pub struct ColorRenderTarget {
     pub used_rect: DeviceIntRect,
     pub resolve_ops: Vec<ResolveOp>,
     pub clear_color: Option<ColorF>,
+
+    pub prim_instances: Vec<PrimitiveInstanceData>,
+    pub prim_instances_with_scissor: FastHashMap<DeviceIntRect, Vec<PrimitiveInstanceData>>,
+
+    pub clip_masks: Vec<ClipMaskInstanceList>,
 }
 
 impl RenderTarget for ColorRenderTarget {
@@ -246,6 +261,9 @@ impl RenderTarget for ColorRenderTarget {
             used_rect,
             resolve_ops: Vec::new(),
             clear_color: Some(ColorF::TRANSPARENT),
+            prim_instances: Vec::new(),
+            prim_instances_with_scissor: FastHashMap::default(),
+            clip_masks: Vec::new(),
         }
     }
 
@@ -259,6 +277,7 @@ impl RenderTarget for ColorRenderTarget {
         z_generator: &mut ZBufferIdGenerator,
         prim_instances: &[PrimitiveInstance],
         cmd_buffers: &CommandBufferList,
+        gpu_buffer_builder: &mut GpuBufferBuilder,
     ) {
         profile_scope!("build");
         let mut merged_batches = AlphaBatchContainer::new(None);
@@ -297,12 +316,9 @@ impl RenderTarget for ColorRenderTarget {
                     let mut batch_builder = BatchBuilder::new(alpha_batch_builder);
                     let cmd_buffer = cmd_buffers.get(pic_task.cmd_buffer_index);
 
-                    cmd_buffer.iter_prims(&mut |prim_instance_index, spatial_node_index, gpu_address| {
-                        let prim_instance = &prim_instances[prim_instance_index.0 as usize];
-
+                    cmd_buffer.iter_prims(&mut |cmd, spatial_node_index, segments| {
                         batch_builder.add_prim_to_batch(
-                            prim_instance,
-                            gpu_address,
+                            cmd,
                             spatial_node_index,
                             ctx,
                             gpu_cache,
@@ -312,6 +328,9 @@ impl RenderTarget for ColorRenderTarget {
                             pic_task.raster_spatial_node_index,
                             pic_task.surface_spatial_node_index,
                             z_generator,
+                            prim_instances,
+                            gpu_buffer_builder,
+                            segments,
                         );
                     });
 
@@ -342,16 +361,44 @@ impl RenderTarget for ColorRenderTarget {
     fn add_task(
         &mut self,
         task_id: RenderTaskId,
-        _ctx: &RenderTargetContext,
+        ctx: &RenderTargetContext,
         gpu_cache: &mut GpuCache,
+        gpu_buffer_builder: &mut GpuBufferBuilder,
         render_tasks: &RenderTaskGraph,
         _: &ClipStore,
-        _: &mut TransformPalette,
+        transforms: &mut TransformPalette,
     ) {
         profile_scope!("add_task");
         let task = &render_tasks[task_id];
 
         match task.kind {
+            RenderTaskKind::Prim(ref info) => {
+                let render_task_address = task_id.into();
+                let target_rect = task.get_target_rect();
+
+                add_quad_to_batch(
+                    render_task_address,
+                    info.transform_id,
+                    info.prim_address_f,
+                    info.quad_flags,
+                    info.edge_flags,
+                    INVALID_SEGMENT_INDEX as u8,
+                    RenderTaskId::INVALID,
+                    ZBufferId(0),
+                    render_tasks,
+                    gpu_buffer_builder,
+                    |_, instance| {
+                        if info.prim_needs_scissor_rect {
+                            self.prim_instances_with_scissor
+                                .entry(target_rect)
+                                .or_insert(Vec::new())
+                                .push(instance);
+                        } else {
+                            self.prim_instances.push(instance);
+                        }
+                    }
+                );
+            }
             RenderTaskKind::VerticalBlur(..) => {
                 add_blur_instances(
                     &mut self.vertical_blurs,
@@ -397,6 +444,7 @@ impl RenderTarget for ColorRenderTarget {
             RenderTaskKind::RadialGradient(..) |
             RenderTaskKind::ConicGradient(..) |
             RenderTaskKind::TileComposite(..) |
+            RenderTaskKind::Empty(..) |
             RenderTaskKind::LineDecoration(..) => {
                 panic!("Should not be added to color target!");
             }
@@ -410,8 +458,7 @@ impl RenderTarget for ColorRenderTarget {
                 );
             }
             RenderTaskKind::Blit(ref task_info) => {
-                let target_rect = task
-                    .get_target_rect();
+                let target_rect = task.get_target_rect();
                 self.blits.push(BlitJob {
                     source: task_info.source,
                     target_rect,
@@ -420,6 +467,16 @@ impl RenderTarget for ColorRenderTarget {
             #[cfg(test)]
             RenderTaskKind::Test(..) => {}
         }
+
+        build_sub_pass(
+            task_id,
+            task,
+            gpu_buffer_builder,
+            render_tasks,
+            transforms,
+            ctx,
+            &mut self.clip_masks,
+        );
     }
 
     fn needs_depth(&self) -> bool {
@@ -444,6 +501,7 @@ pub struct AlphaRenderTarget {
     pub zero_clears: Vec<RenderTaskId>,
     pub one_clears: Vec<RenderTaskId>,
     pub texture_id: CacheTextureId,
+    pub clip_masks: Vec<ClipMaskInstanceList>,
 }
 
 impl RenderTarget for AlphaRenderTarget {
@@ -461,6 +519,7 @@ impl RenderTarget for AlphaRenderTarget {
             zero_clears: Vec::new(),
             one_clears: Vec::new(),
             texture_id,
+            clip_masks: Vec::new(),
         }
     }
 
@@ -473,6 +532,7 @@ impl RenderTarget for AlphaRenderTarget {
         task_id: RenderTaskId,
         ctx: &RenderTargetContext,
         gpu_cache: &mut GpuCache,
+        gpu_buffer_builder: &mut GpuBufferBuilder,
         render_tasks: &RenderTaskGraph,
         clip_store: &ClipStore,
         transforms: &mut TransformPalette,
@@ -494,8 +554,15 @@ impl RenderTarget for AlphaRenderTarget {
             RenderTaskKind::RadialGradient(..) |
             RenderTaskKind::ConicGradient(..) |
             RenderTaskKind::TileComposite(..) |
+            RenderTaskKind::Prim(..) |
             RenderTaskKind::SvgFilter(..) => {
                 panic!("BUG: should not be added to alpha target!");
+            }
+            RenderTaskKind::Empty(..) => {
+                // TODO(gw): Could likely be more efficient by choosing to clear to 0 or 1
+                //           based on the clip chain, or even skipping clear and masking the
+                //           prim region with blend disabled.
+                self.one_clears.push(task_id);
             }
             RenderTaskKind::VerticalBlur(..) => {
                 self.zero_clears.push(task_id);
@@ -562,6 +629,16 @@ impl RenderTarget for AlphaRenderTarget {
             #[cfg(test)]
             RenderTaskKind::Test(..) => {}
         }
+
+        build_sub_pass(
+            task_id,
+            task,
+            gpu_buffer_builder,
+            render_tasks,
+            transforms,
+            ctx,
+            &mut self.clip_masks,
+        );
     }
 
     fn needs_depth(&self) -> bool {
@@ -636,7 +713,6 @@ impl TextureCacheRenderTarget {
         &mut self,
         task_id: RenderTaskId,
         render_tasks: &RenderTaskGraph,
-        gpu_cache: &mut GpuCache,
     ) {
         profile_scope!("add_task");
         let task_address = task_id.into();
@@ -700,14 +776,15 @@ impl TextureCacheRenderTarget {
                 self.fast_linear_gradients.push(task_info.to_instance(&target_rect));
             }
             RenderTaskKind::LinearGradient(ref task_info) => {
-                self.linear_gradients.push(task_info.to_instance(&target_rect, gpu_cache));
+                self.linear_gradients.push(task_info.to_instance(&target_rect));
             }
             RenderTaskKind::RadialGradient(ref task_info) => {
-                self.radial_gradients.push(task_info.to_instance(&target_rect, gpu_cache));
+                self.radial_gradients.push(task_info.to_instance(&target_rect));
             }
             RenderTaskKind::ConicGradient(ref task_info) => {
-                self.conic_gradients.push(task_info.to_instance(&target_rect, gpu_cache));
+                self.conic_gradients.push(task_info.to_instance(&target_rect));
             }
+            RenderTaskKind::Prim(..) |
             RenderTaskKind::Image(..) |
             RenderTaskKind::Cached(..) |
             RenderTaskKind::VerticalBlur(..) |
@@ -717,6 +794,7 @@ impl TextureCacheRenderTarget {
             RenderTaskKind::Readback(..) |
             RenderTaskKind::Scaling(..) |
             RenderTaskKind::TileComposite(..) |
+            RenderTaskKind::Empty(..) |
             RenderTaskKind::SvgFilter(..) => {
                 panic!("BUG: unexpected task kind for texture cache target");
             }
@@ -824,10 +902,10 @@ fn add_svg_filter_instances(
     let generic_int = match filter {
         SvgFilterInfo::Blend(mode) => *mode as u16,
         SvgFilterInfo::ComponentTransfer(data) =>
-            ((data.r_func.to_int() << 12 |
-              data.g_func.to_int() << 8 |
-              data.b_func.to_int() << 4 |
-              data.a_func.to_int()) as u16),
+            (data.r_func.to_int() << 12 |
+             data.g_func.to_int() << 8 |
+             data.b_func.to_int() << 4 |
+             data.a_func.to_int()) as u16,
         SvgFilterInfo::Composite(operator) =>
             operator.as_int() as u16,
         SvgFilterInfo::LinearToSrgb |
@@ -847,6 +925,7 @@ fn add_svg_filter_instances(
         kind,
         input_count,
         generic_int,
+        padding: 0,
         extra_data_address: extra_data_address.unwrap_or(GpuCacheAddress::INVALID),
     };
 
@@ -879,4 +958,304 @@ pub struct LineDecorationJob {
     pub wavy_line_thickness: f32,
     pub style: i32,
     pub axis_select: f32,
+}
+
+fn build_mask_tasks(
+    info: &MaskSubPass,
+    render_task_address: RenderTaskAddress,
+    task_world_rect: WorldRect,
+    target_rect: DeviceIntRect,
+    main_prim_address: GpuBufferAddress,
+    prim_spatial_node_index: SpatialNodeIndex,
+    raster_spatial_node_index: SpatialNodeIndex,
+    clip_store: &ClipStore,
+    data_stores: &DataStores,
+    spatial_tree: &SpatialTree,
+    gpu_buffer_builder: &mut GpuBufferBuilder,
+    transforms: &mut TransformPalette,
+    render_tasks: &RenderTaskGraph,
+    results: &mut ClipMaskInstanceList,
+) {
+    for i in 0 .. info.clip_node_range.count {
+        let clip_instance = clip_store.get_instance_from_range(&info.clip_node_range, i);
+        let clip_node = &data_stores.clip[clip_instance.handle];
+
+        let (clip_address, fast_path) = match clip_node.item.kind {
+            ClipItemKind::RoundedRectangle { rect, radius, mode } => {
+                let (fast_path, clip_address) = if radius.is_uniform().is_some() {
+                    let mut writer = gpu_buffer_builder.f32.write_blocks(3);
+                    writer.push_one(rect);
+                    writer.push_one([radius.top_left.width, 0.0, 0.0, 0.0]);
+                    writer.push_one([mode as i32 as f32, 0.0, 0.0, 0.0]);
+                    let clip_address = writer.finish();
+
+                    (true, clip_address)
+                } else {
+                    let mut writer = gpu_buffer_builder.f32.write_blocks(4);
+                    writer.push_one(rect);
+                    writer.push_one([
+                        radius.top_left.width,
+                        radius.top_left.height,
+                        radius.top_right.width,
+                        radius.top_right.height,
+                    ]);
+                    writer.push_one([
+                        radius.bottom_left.width,
+                        radius.bottom_left.height,
+                        radius.bottom_right.width,
+                        radius.bottom_right.height,
+                    ]);
+                    writer.push_one([mode as i32 as f32, 0.0, 0.0, 0.0]);
+                    let clip_address = writer.finish();
+
+                    (false, clip_address)
+                };
+
+                (clip_address, fast_path)
+            }
+            ClipItemKind::Rectangle { rect, mode, .. } => {
+                assert_eq!(mode, ClipMode::Clip);
+
+                let mut writer = gpu_buffer_builder.f32.write_blocks(3);
+                writer.push_one(rect);
+                writer.push_one([0.0, 0.0, 0.0, 0.0]);
+                writer.push_one([mode as i32 as f32, 0.0, 0.0, 0.0]);
+                let clip_address = writer.finish();
+
+                (clip_address, true)
+            }
+            ClipItemKind::BoxShadow { .. } => {
+                panic!("bug: box-shadow clips not expected on non-legacy rect/quads");
+            }
+            ClipItemKind::Image { rect, .. } => {
+                let clip_transform_id = transforms.get_id(
+                    clip_node.item.spatial_node_index,
+                    raster_spatial_node_index,
+                    spatial_tree,
+                );
+
+                let is_same_coord_system = spatial_tree.is_matching_coord_system(
+                    prim_spatial_node_index,
+                    raster_spatial_node_index,
+                );
+
+                let clip_needs_scissor_rect = !is_same_coord_system;
+                let mut quad_flags = QuadFlags::SAMPLE_AS_MASK;
+
+                if is_same_coord_system {
+                    quad_flags |= QuadFlags::APPLY_DEVICE_CLIP;
+                }
+
+                for tile in clip_store.visible_mask_tiles(&clip_instance) {
+                    let clip_prim_address = write_prim_blocks(
+                        &mut gpu_buffer_builder.f32,
+                        rect,
+                        rect,
+                        PremultipliedColorF::WHITE,
+                        &[QuadSegment {
+                            rect: tile.tile_rect,
+                            task_id: tile.task_id,
+                        }]
+                    );
+
+                    let texture = render_tasks
+                        .resolve_texture(tile.task_id)
+                        .expect("bug: texture not found for tile");
+
+                    add_quad_to_batch(
+                        render_task_address,
+                        clip_transform_id,
+                        clip_prim_address,
+                        quad_flags,
+                        EdgeAaSegmentMask::empty(),
+                        0,
+                        tile.task_id,
+                        ZBufferId(0),
+                        render_tasks,
+                        gpu_buffer_builder,
+                        |_, prim| {
+                            if clip_needs_scissor_rect {
+                                results
+                                    .image_mask_instances_with_scissor
+                                    .entry((target_rect, texture))
+                                    .or_insert(Vec::new())
+                                    .push(prim);
+                            } else {
+                                results
+                                    .image_mask_instances
+                                    .entry(texture)
+                                    .or_insert(Vec::new())
+                                    .push(prim);
+                            }
+                        }
+                    );
+                }
+
+                // TODO(gw): For now, we skip the main mask prim below for image masks. Perhaps
+                //           we can better merge the logic together?
+                // TODO(gw): How to efficiently handle if the image-mask rect doesn't cover local prim rect?
+                continue;
+            }
+        };
+
+        let prim_spatial_node = spatial_tree.get_spatial_node(prim_spatial_node_index);
+        let clip_spatial_node = spatial_tree.get_spatial_node(clip_node.item.spatial_node_index);
+        let raster_spatial_node = spatial_tree.get_spatial_node(raster_spatial_node_index);
+        let raster_clip = raster_spatial_node.coordinate_system_id == clip_spatial_node.coordinate_system_id;
+
+        let (clip_space, clip_transform_id, main_prim_address, prim_transform_id, is_same_coord_system) = if raster_clip {
+            let prim_transform_id = TransformPaletteId::IDENTITY;
+
+            let clip_transform_id = transforms.get_id(
+                raster_spatial_node_index,
+                clip_node.item.spatial_node_index,
+                spatial_tree,
+            );
+
+            let main_prim_address = write_prim_blocks(
+                &mut gpu_buffer_builder.f32,
+                task_world_rect.cast_unit(),
+                task_world_rect.cast_unit(),
+                PremultipliedColorF::WHITE,
+                &[],
+            );
+
+            (ClipSpace::Raster, clip_transform_id, main_prim_address, prim_transform_id, true)
+        } else {
+            let prim_transform_id = transforms.get_id(
+                prim_spatial_node_index,
+                raster_spatial_node_index,
+                spatial_tree,
+            );
+
+            let clip_transform_id = if prim_spatial_node.coordinate_system_id < clip_spatial_node.coordinate_system_id {
+                transforms.get_id(
+                    clip_node.item.spatial_node_index,
+                    prim_spatial_node_index,
+                    spatial_tree,
+                )
+            } else {
+                transforms.get_id(
+                    prim_spatial_node_index,
+                    clip_node.item.spatial_node_index,
+                    spatial_tree,
+                )
+            };
+
+            let is_same_coord_system = spatial_tree.is_matching_coord_system(
+                prim_spatial_node_index,
+                raster_spatial_node_index,
+            );
+
+            (ClipSpace::Primitive, clip_transform_id, main_prim_address, prim_transform_id, is_same_coord_system)
+        };
+
+        let clip_needs_scissor_rect = !is_same_coord_system;
+
+        let quad_flags = if is_same_coord_system {
+            QuadFlags::APPLY_DEVICE_CLIP
+        } else {
+            QuadFlags::empty()
+        };
+
+        add_quad_to_batch(
+            render_task_address,
+            prim_transform_id,
+            main_prim_address,
+            quad_flags,
+            EdgeAaSegmentMask::all(),
+            INVALID_SEGMENT_INDEX as u8,
+            RenderTaskId::INVALID,
+            ZBufferId(0),
+            render_tasks,
+            gpu_buffer_builder,
+            |_, prim| {
+                let instance = MaskInstance {
+                    prim,
+                    clip_transform_id,
+                    clip_address: clip_address.as_int(),
+                    clip_space,
+                    unused: 0,
+                };
+
+                if clip_needs_scissor_rect {
+                    if fast_path {
+                        results.mask_instances_fast_with_scissor
+                               .entry(target_rect)
+                               .or_insert(Vec::new())
+                               .push(instance);
+                    } else {
+                        results.mask_instances_slow_with_scissor
+                               .entry(target_rect)
+                               .or_insert(Vec::new())
+                               .push(instance);
+                    }
+                } else {
+                    if fast_path {
+                        results.mask_instances_fast.push(instance);
+                    } else {
+                        results.mask_instances_slow.push(instance);
+                    }
+                }
+            }
+        );
+    }
+}
+
+fn build_sub_pass(
+    task_id: RenderTaskId,
+    task: &RenderTask,
+    gpu_buffer_builder: &mut GpuBufferBuilder,
+    render_tasks: &RenderTaskGraph,
+    transforms: &mut TransformPalette,
+    ctx: &RenderTargetContext,
+    output: &mut Vec<ClipMaskInstanceList>,
+) {
+    if let Some(ref sub_pass) = task.sub_pass {
+        match sub_pass {
+            SubPass::Masks { ref masks } => {
+                let render_task_address = task_id.into();
+                let target_rect = task.get_target_rect();
+
+                let (device_pixel_scale, content_origin, raster_spatial_node_index) = match task.kind {
+                    RenderTaskKind::Picture(ref info) => {
+                        (info.device_pixel_scale, info.content_origin, info.raster_spatial_node_index)
+                    }
+                    RenderTaskKind::Empty(ref info) => {
+                        (info.device_pixel_scale, info.content_origin, info.raster_spatial_node_index)
+                    }
+                    RenderTaskKind::Prim(ref info) => {
+                        (info.device_pixel_scale, info.content_origin, info.raster_spatial_node_index)
+                    }
+                    _ => panic!("unexpected: {}", task.kind.as_str()),
+                };
+
+                let content_rect = DeviceRect::new(
+                    content_origin,
+                    content_origin + target_rect.size().to_f32(),
+                );
+
+                let mut clip_masks = ClipMaskInstanceList::new();
+
+                build_mask_tasks(
+                    masks,
+                    render_task_address,
+                    content_rect / device_pixel_scale,
+                    target_rect,
+                    masks.prim_address_f,
+                    masks.prim_spatial_node_index,
+                    raster_spatial_node_index,
+                    ctx.clip_store,
+                    ctx.data_stores,
+                    ctx.spatial_tree,
+                    gpu_buffer_builder,
+                    transforms,
+                    render_tasks,
+                    &mut clip_masks,
+                );
+
+                output.push(clip_masks);
+            }
+        }
+    }
 }

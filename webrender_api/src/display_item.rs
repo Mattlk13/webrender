@@ -34,10 +34,12 @@ pub type ItemTag = (u64, u16);
 /// refers to individual display items, but this may change later.
 pub type ItemKey = u16;
 
+#[repr(C)]
+#[derive(Copy, PartialEq, Eq, Clone, PartialOrd, Ord, Hash, Deserialize, MallocSizeOf, Serialize, PeekPoke)]
+pub struct PrimitiveFlags(u8);
+
 bitflags! {
-    #[repr(C)]
-    #[derive(Deserialize, MallocSizeOf, Serialize, PeekPoke)]
-    pub struct PrimitiveFlags: u8 {
+    impl PrimitiveFlags: u8 {
         /// The CSS backface-visibility property (yes, it can be really granular)
         const IS_BACKFACE_VISIBLE = 1 << 0;
         /// If set, this primitive represents a scroll bar container
@@ -54,6 +56,16 @@ bitflags! {
         const ANTIALISED = 1 << 4;
         /// If true, this primitive is used as a background for checkerboarding
         const CHECKERBOARD_BACKGROUND = 1 << 5;
+    }
+}
+
+impl core::fmt::Debug for PrimitiveFlags {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        if self.is_empty() {
+            write!(f, "{:#x}", Self::empty().bits())
+        } else {
+            bitflags::parser::to_writer(self, f)
+        }
     }
 }
 
@@ -525,10 +537,6 @@ pub struct NinePatchBorder {
     /// Determines what happens if the vertical side parts of the 9-part
     /// image have a different size than the vertical parts of the border.
     pub repeat_vertical: RepeatMode,
-
-    /// The outset for the border.
-    /// TODO(mrobinson): This should be removed and handled by the client.
-    pub outset: LayoutSideOffsets, // TODO: what unit is this in?
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize, PeekPoke)]
@@ -934,10 +942,12 @@ impl Hash for RasterSpace {
     }
 }
 
+#[repr(C)]
+#[derive(Copy, PartialEq, Eq, Clone, PartialOrd, Ord, Hash, Deserialize, MallocSizeOf, Serialize, PeekPoke)]
+pub struct StackingContextFlags(u8);
+
 bitflags! {
-    #[repr(C)]
-    #[derive(Deserialize, MallocSizeOf, Serialize, PeekPoke)]
-    pub struct StackingContextFlags: u8 {
+    impl StackingContextFlags: u8 {
         /// If true, this stacking context is a blend container than contains
         /// mix-blend-mode children (and should thus be isolated).
         const IS_BLEND_CONTAINER = 1 << 0;
@@ -945,6 +955,16 @@ bitflags! {
         /// a clip-mask). This is needed to allow the correct selection of a backdrop root
         /// since a clip-mask stacking context creates a parent surface.
         const WRAPS_BACKDROP_FILTER = 1 << 1;
+    }
+}
+
+impl core::fmt::Debug for StackingContextFlags {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        if self.is_empty() {
+            write!(f, "{:#x}", Self::empty().bits())
+        } else {
+            bitflags::parser::to_writer(self, f)
+        }
     }
 }
 
@@ -1472,17 +1492,12 @@ impl YuvFormat {
 pub struct ImageMask {
     pub image: ImageKey,
     pub rect: LayoutRect,
-    pub repeat: bool,
 }
 
 impl ImageMask {
     /// Get a local clipping rect contributed by this mask.
     pub fn get_local_clip_rect(&self) -> Option<LayoutRect> {
-        if self.repeat {
-            None
-        } else {
-            Some(self.rect)
-        }
+        Some(self.rect)
     }
 }
 
@@ -1635,9 +1650,12 @@ impl ClipChainId {
 
 /// A reference to a clipping node defining how an item is clipped.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, PeekPoke)]
-pub enum ClipId {
-    Clip(usize, PipelineId),
-    ClipChain(ClipChainId),
+pub struct ClipId(pub usize, pub PipelineId);
+
+impl Default for ClipId {
+    fn default() -> Self {
+        ClipId::invalid()
+    }
 }
 
 const ROOT_CLIP_ID: usize = 0;
@@ -1645,33 +1663,30 @@ const ROOT_CLIP_ID: usize = 0;
 impl ClipId {
     /// Return the root clip ID - effectively doing no clipping.
     pub fn root(pipeline_id: PipelineId) -> Self {
-        ClipId::Clip(ROOT_CLIP_ID, pipeline_id)
+        ClipId(ROOT_CLIP_ID, pipeline_id)
     }
 
     /// Return an invalid clip ID - needed in places where we carry
     /// one but need to not attempt to use it.
     pub fn invalid() -> Self {
-        ClipId::Clip(!0, PipelineId::dummy())
+        ClipId(!0, PipelineId::dummy())
     }
 
     pub fn pipeline_id(&self) -> PipelineId {
         match *self {
-            ClipId::Clip(_, pipeline_id) |
-            ClipId::ClipChain(ClipChainId(_, pipeline_id)) => pipeline_id,
+            ClipId(_, pipeline_id) => pipeline_id,
         }
     }
 
     pub fn is_root(&self) -> bool {
         match *self {
-            ClipId::Clip(id, _) => id == ROOT_CLIP_ID,
-            ClipId::ClipChain(_) => false,
+            ClipId(id, _) => id == ROOT_CLIP_ID,
         }
     }
 
     pub fn is_valid(&self) -> bool {
         match *self {
-            ClipId::Clip(id, _) => id != !0,
-            _ => true,
+            ClipId(id, _) => id != !0,
         }
     }
 }
@@ -1788,7 +1803,6 @@ impl_default_for_enums! {
     ComponentTransferFuncType => Identity,
     ClipMode => Clip,
     FillRule => Nonzero,
-    ClipId => ClipId::invalid(),
     ReferenceFrameKind => Transform {
         is_2d_scale_translation: false,
         should_snap: false,

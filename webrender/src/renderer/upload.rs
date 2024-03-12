@@ -24,7 +24,7 @@ use euclid::{Transform3D, point2};
 use time::precise_time_ns;
 use malloc_size_of::MallocSizeOfOps;
 use api::units::*;
-use api::{ExternalImageSource, ImageBufferKind, ImageRendering, ImageFormat};
+use api::{ExternalImageSource, ImageBufferKind, ImageFormat};
 use crate::renderer::{
     Renderer, VertexArrayKind, RendererStats, TextureSampler, TEXTURE_CACHE_DBG_CLEAR_COLOR
 };
@@ -43,6 +43,7 @@ use crate::profiler;
 use crate::render_api::MemoryReport;
 
 pub const BATCH_UPLOAD_TEXTURE_SIZE: DeviceIntSize = DeviceIntSize::new(512, 512);
+const BATCH_UPLOAD_FORMAT_COUNT: usize = 4;
 
 /// Upload a number of items to texture cache textures.
 ///
@@ -99,7 +100,7 @@ pub fn upload_to_texture_cache(
                         .as_mut()
                         .expect("Found external image, but no handler set!");
                     // The filter is only relevant for NativeTexture external images.
-                    match handler.lock(id, channel_index, ImageRendering::Auto).source {
+                    match handler.lock(id, channel_index).source {
                         ExternalImageSource::RawData(data) => {
                             &data[offset as usize ..]
                         }
@@ -627,10 +628,10 @@ pub struct UploadTexturePool {
     /// The textures in the pool associated with a last used frame index.
     ///
     /// The outer array corresponds to each of teh three supported texture formats.
-    textures: [VecDeque<(Texture, u64)>; 3],
+    textures: [VecDeque<(Texture, u64)>; BATCH_UPLOAD_FORMAT_COUNT],
     // Frame at which to deallocate some textures if there are too many in the pool,
     // for each format.
-    delay_texture_deallocation: [u64; 3],
+    delay_texture_deallocation: [u64; BATCH_UPLOAD_FORMAT_COUNT],
     current_frame: u64,
 
     /// Temporary buffers that are used when using staging uploads + glTexImage2D.
@@ -646,8 +647,8 @@ pub struct UploadTexturePool {
 impl UploadTexturePool {
     pub fn new() -> Self {
         UploadTexturePool {
-            textures: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
-            delay_texture_deallocation: [0; 3],
+            textures: [VecDeque::new(), VecDeque::new(), VecDeque::new(), VecDeque::new()],
+            delay_texture_deallocation: [0; BATCH_UPLOAD_FORMAT_COUNT],
             current_frame: 0,
             temporary_buffers: Vec::new(),
             min_temporary_buffers: 0,
@@ -660,7 +661,8 @@ impl UploadTexturePool {
             ImageFormat::RGBA8 => 0,
             ImageFormat::BGRA8 => 1,
             ImageFormat::R8 => 2,
-            _ => { panic!("unexpected format"); }
+            ImageFormat::R16 => 3,
+            _ => { panic!("unexpected format {:?}", format); }
         }
     }
 

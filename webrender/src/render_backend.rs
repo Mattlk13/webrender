@@ -8,13 +8,14 @@
 //! See the comment at the top of the `renderer` module for a description of
 //! how these two pieces interact.
 
-use api::{DebugFlags, Parameter, BoolParameter, PrimitiveFlags};
+use api::{DebugFlags, Parameter, BoolParameter, PrimitiveFlags, MinimapData};
 use api::{DocumentId, ExternalScrollId, HitTestResult};
 use api::{IdNamespace, PipelineId, RenderNotifier, SampledScrollOffset};
 use api::{NotificationRequest, Checkpoint, QualitySettings};
-use api::{PrimitiveKeyKind, RenderReasons};
+use api::{FramePublishId, PrimitiveKeyKind, RenderReasons};
 use api::units::*;
 use api::channel::{single_msg_channel, Sender, Receiver};
+use crate::AsyncPropertySampler;
 #[cfg(any(feature = "capture", feature = "replay"))]
 use crate::render_api::CaptureBits;
 #[cfg(feature = "replay")]
@@ -26,7 +27,7 @@ use crate::filterdata::FilterDataIntern;
 use crate::capture::CaptureConfig;
 use crate::composite::{CompositorKind, CompositeDescriptor};
 use crate::frame_builder::{FrameBuilder, FrameBuilderConfig, FrameScratchBuffer};
-use crate::glyph_rasterizer::{FontInstance};
+use glyph_rasterizer::{FontInstance};
 use crate::gpu_cache::GpuCache;
 use crate::hit_test::{HitTest, HitTester, SharedHitTester};
 use crate::intern::DataStore;
@@ -41,7 +42,7 @@ use crate::prim_store::{PrimitiveInstanceKind, PrimTemplateCommonData};
 use crate::prim_store::interned::*;
 use crate::profiler::{self, TransactionProfile};
 use crate::render_task_graph::RenderTaskGraphBuilder;
-use crate::renderer::{AsyncPropertySampler, FullFrameStats, PipelineInfo};
+use crate::renderer::{FullFrameStats, PipelineInfo};
 use crate::resource_cache::ResourceCache;
 #[cfg(feature = "replay")]
 use crate::resource_cache::PlainCacheOwn;
@@ -367,6 +368,8 @@ struct Document {
     /// Retained frame-building version of the spatial tree
     spatial_tree: SpatialTree,
 
+    minimap_data: FastHashMap<ExternalScrollId, MinimapData>,
+
     /// Contains various vecs of data that is used only during frame building,
     /// where we want to recycle the memory each new display list, to avoid constantly
     /// re-allocating and moving memory around.
@@ -412,6 +415,7 @@ impl Document {
             has_built_scene: false,
             data_stores: DataStores::default(),
             spatial_tree: SpatialTree::new(),
+            minimap_data: FastHashMap::default(),
             scratch: ScratchBuffer::default(),
             #[cfg(feature = "replay")]
             loaded_scene: Scene::new(),
@@ -488,6 +492,9 @@ impl Document {
                     }
                 }
             }
+            FrameMsg::SetMinimapData(id, minimap_data) => {
+              self.minimap_data.insert(id, minimap_data);
+            }
         }
 
         DocumentOps::nop()
@@ -526,6 +533,10 @@ impl Document {
                 &mut self.spatial_tree,
                 self.dirty_rects_are_valid,
                 &mut self.profile,
+                // Consume the minimap data. If APZ wants a minimap rendered
+                // on the next frame, it will add new entries to the minimap
+                // data during sampling.
+                mem::take(&mut self.minimap_data)
             );
 
             frame
@@ -716,6 +727,9 @@ pub struct RenderBackend {
     /// A map of tile caches. These are stored in the backend as they are
     /// persisted between both frame and scenes.
     tile_caches: FastHashMap<SliceId, Box<TileCacheInstance>>,
+
+    /// The id of the latest PublishDocument
+    frame_publish_id: FramePublishId,
 }
 
 impl RenderBackend {
@@ -751,6 +765,7 @@ impl RenderBackend {
             #[cfg(feature = "replay")]
             loaded_resource_sequence_id: 0,
             tile_caches: FastHashMap::default(),
+            frame_publish_id: FramePublishId::first(),
         }
     }
 
@@ -853,6 +868,14 @@ impl RenderBackend {
                     Some(txn.frame_stats)
                 };
 
+                // Before updating the spatial tree, save the most recently sampled
+                // scroll offsets (which include async deltas).
+                let last_sampled_scroll_offsets = if self.sampler.is_some() {
+                    Some(doc.spatial_tree.get_last_sampled_scroll_offsets())
+                } else {
+                    None
+                };
+
                 if let Some(updates) = txn.spatial_tree_updates.take() {
                     doc.spatial_tree.apply_updates(updates);
                 }
@@ -871,6 +894,17 @@ impl RenderBackend {
                 // This needs to happen before we build the hit tester.
                 if let Some(updates) = txn.interner_updates.take() {
                     doc.data_stores.apply_updates(updates, &mut doc.profile);
+                }
+
+                // Apply the last sampled scroll offsets from the previous scene,
+                // to the current scene. The offsets are identified by scroll ids
+                // which are stable across scenes. This ensures that a hit test,
+                // which could occur in between post-swap hook and the call to
+                // update_document() below, does not observe raw main-thread offsets
+                // from the new scene that don't have async deltas applied to them.
+                if let Some(last_sampled) = last_sampled_scroll_offsets {
+                    doc.spatial_tree
+                        .apply_last_sampled_scroll_offsets(last_sampled);
                 }
 
                 // Build the hit tester while the APZ lock is held so that its content
@@ -959,6 +993,9 @@ impl RenderBackend {
 
                 for (_, doc) in &mut self.documents {
                     doc.scratch.memory_pressure();
+                    for tile_cache in self.tile_caches.values_mut() {
+                        tile_cache.memory_pressure(&mut self.resource_cache);
+                    }
                 }
 
                 let resource_updates = self.resource_cache.pending_updates();
@@ -974,16 +1011,6 @@ impl RenderBackend {
             }
             ApiMsg::DebugCommand(option) => {
                 let msg = match option {
-                    DebugCommand::EnableDualSourceBlending(enable) => {
-                        // Set in the config used for any future documents
-                        // that are created.
-                        self.frame_config
-                            .dual_source_blending_is_enabled = enable;
-                        self.update_frame_builder_config();
-
-                        // We don't want to forward this message to the renderer.
-                        return RenderBackendStatus::Continue;
-                    }
                     DebugCommand::SetPictureTileSize(tile_size) => {
                         self.frame_config.tile_size_override = tile_size;
                         self.update_frame_builder_config();
@@ -1480,7 +1507,9 @@ impl RenderBackend {
             self.result_tx.send(msg).unwrap();
 
             // Publish the frame
+            self.frame_publish_id.advance();
             let msg = ResultMsg::PublishDocument(
+                self.frame_publish_id,
                 document_id,
                 rendered_document,
                 pending_update,
@@ -1515,7 +1544,7 @@ impl RenderBackend {
             } else if render_frame {
                 doc.rendered_frame_is_valid = true;
             }
-            self.notifier.new_frame_ready(document_id, scroll, render_frame);
+            self.notifier.new_frame_ready(document_id, scroll, render_frame, self.frame_publish_id);
         }
 
         if !doc.hit_tester_is_valid {
@@ -1606,6 +1635,9 @@ impl RenderBackend {
         for (&id, doc) in &mut self.documents {
             debug!("\tdocument {:?}", id);
             if config.bits.contains(CaptureBits::FRAME) {
+                // Temporarily force invalidation otherwise the render task graph dump is empty.
+                let force_invalidation = std::mem::replace(&mut doc.scene.config.force_invalidation, true);
+
                 let rendered_document = doc.build_frame(
                     &mut self.resource_cache,
                     &mut self.gpu_cache,
@@ -1614,6 +1646,9 @@ impl RenderBackend {
                     None,
                     RenderReasons::empty(),
                 );
+
+                doc.scene.config.force_invalidation = force_invalidation;
+
                 // After we rendered the frames, there are pending updates to both
                 // GPU cache and resources. Instead of serializing them, we are going to make sure
                 // they are applied on the `Renderer` side.
@@ -1856,6 +1891,7 @@ impl RenderBackend {
                         data_stores,
                         scratch: ScratchBuffer::default(),
                         spatial_tree: frame_spatial_tree,
+                        minimap_data: FastHashMap::default(),
                         loaded_scene: scene.clone(),
                         prev_composite_descriptor: CompositeDescriptor::empty(),
                         dirty_rects_are_valid: false,
@@ -1876,7 +1912,9 @@ impl RenderBackend {
                     let msg_update = ResultMsg::UpdateGpuCache(self.gpu_cache.extract_updates());
                     self.result_tx.send(msg_update).unwrap();
 
+                    self.frame_publish_id.advance();
                     let msg_publish = ResultMsg::PublishDocument(
+                        self.frame_publish_id,
                         id,
                         RenderedDocument {
                             frame,
@@ -1889,7 +1927,7 @@ impl RenderBackend {
                     );
                     self.result_tx.send(msg_publish).unwrap();
 
-                    self.notifier.new_frame_ready(id, false, true);
+                    self.notifier.new_frame_ready(id, false, true, self.frame_publish_id);
 
                     // We deserialized the state of the frame so we don't want to build
                     // it (but we do want to update the scene builder's state)

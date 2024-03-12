@@ -10,7 +10,6 @@ use std::ops::{Add, Sub};
 use std::sync::Arc;
 // local imports
 use crate::{IdNamespace, TileSize};
-use crate::display_item::ImageRendering;
 use crate::font::{FontInstanceKey, FontInstanceData, FontKey, FontTemplate};
 use crate::units::*;
 
@@ -93,8 +92,8 @@ pub struct ExternalImage<'a> {
 pub trait ExternalImageHandler {
     /// Lock the external image. Then, WR could start to read the image content.
     /// The WR client should not change the image content until the unlock()
-    /// call. Provide ImageRendering for NativeTexture external images.
-    fn lock(&mut self, key: ExternalImageId, channel_index: u8, rendering: ImageRendering) -> ExternalImage;
+    /// call.
+    fn lock(&mut self, key: ExternalImageId, channel_index: u8) -> ExternalImage;
     /// Unlock the external image. WR should not read the image content
     /// after this call.
     fn unlock(&mut self, key: ExternalImageId, channel_index: u8);
@@ -118,6 +117,10 @@ pub enum ImageBufferKind {
     /// understand, particularly YUV. See
     /// https://www.khronos.org/registry/OpenGL/extensions/OES/OES_EGL_image_external.txt
     TextureExternal = 2,
+    /// External texture which is forced to be converted from YUV to RGB using BT709 colorspace.
+    /// This maps to GL_TEXTURE_EXTERNAL_OES in OpenGL, using the EXT_YUV_TARGET extension.
+    /// https://registry.khronos.org/OpenGL/extensions/EXT/EXT_YUV_target.txt
+    TextureExternalBT709 = 3,
 }
 
 /// Storage format identifier for externally-managed images.
@@ -230,7 +233,7 @@ impl ColorDepth {
 
 bitflags! {
     /// Various flags that are part of an image descriptor.
-    #[derive(Deserialize, Serialize)]
+    #[derive(Debug, Copy, PartialEq, Eq, Clone, PartialOrd, Ord, Hash, Deserialize, Serialize)]
     pub struct ImageDescriptorFlags: u32 {
         /// Whether this image is opaque, or has an alpha channel. Avoiding blending
         /// for opaque surfaces is an important optimization.

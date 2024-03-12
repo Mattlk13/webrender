@@ -10,10 +10,10 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::u32;
+use api::MinimapData;
 use time::precise_time_ns;
-//use crate::api::peek_poke::PeekPoke;
 use crate::api::channel::{Sender, single_msg_channel, unbounded_channel};
-use crate::api::{ColorF, BuiltDisplayList, IdNamespace, ExternalScrollId, Parameter, BoolParameter};
+use crate::api::{BuiltDisplayList, IdNamespace, ExternalScrollId, Parameter, BoolParameter};
 use crate::api::{FontKey, FontInstanceKey, NativeFontHandle};
 use crate::api::{BlobImageData, BlobImageKey, ImageData, ImageDescriptor, ImageKey, Epoch, QualitySettings};
 use crate::api::{BlobImageParams, BlobImageRequest, BlobImageResult, AsyncBlobImageRasterizer, BlobImageHandler};
@@ -25,7 +25,7 @@ use crate::api::{FontInstanceOptions, FontInstancePlatformOptions, FontVariation
 use crate::api::DEFAULT_TILE_SIZE;
 use crate::api::units::*;
 use crate::api_resources::ApiResources;
-use crate::glyph_rasterizer::SharedFontResources;
+use glyph_rasterizer::SharedFontResources;
 use crate::scene_builder_thread::{SceneBuilderRequest, SceneBuilderResult};
 use crate::intern::InterningMemoryReport;
 use crate::profiler::{self, TransactionProfile};
@@ -274,15 +274,11 @@ impl Transaction {
     /// Arguments:
     ///
     /// * `epoch`: The unique Frame ID, monotonically increasing.
-    /// * `background`: The background color of this pipeline.
-    /// * `viewport_size`: The size of the viewport for this frame.
     /// * `pipeline_id`: The ID of the pipeline that is supplying this display list.
     /// * `display_list`: The root Display list used in this frame.
     pub fn set_display_list(
         &mut self,
         epoch: Epoch,
-        background: Option<ColorF>,
-        viewport_size: LayoutSize,
         (pipeline_id, mut display_list): (PipelineId, BuiltDisplayList),
     ) {
         display_list.set_send_time_ns(precise_time_ns());
@@ -291,8 +287,6 @@ impl Transaction {
                 display_list,
                 epoch,
                 pipeline_id,
-                background,
-                viewport_size,
             }
         );
     }
@@ -349,6 +343,11 @@ impl Transaction {
     ///
     pub fn set_is_transform_async_zooming(&mut self, is_zooming: bool, animation_id: PropertyBindingId) {
         self.frame_ops.push(FrameMsg::SetIsTransformAsyncZooming(is_zooming, animation_id));
+    }
+
+    /// Specify data for APZ minimap debug overlay to be composited
+    pub fn set_minimap_data(&mut self, id: ExternalScrollId, minimap_data: MinimapData) {
+      self.frame_ops.push(FrameMsg::SetMinimapData(id, minimap_data));
     }
 
     /// Generate a new frame. When it's done and a RenderNotifier has been set
@@ -775,10 +774,6 @@ pub enum SceneMsg {
         epoch: Epoch,
         ///
         pipeline_id: PipelineId,
-        ///
-        background: Option<ColorF>,
-        ///
-        viewport_size: LayoutSize,
     },
     ///
     SetDocumentView {
@@ -810,6 +805,8 @@ pub enum FrameMsg {
     AppendDynamicTransformProperties(Vec<PropertyValue<LayoutTransform>>),
     ///
     SetIsTransformAsyncZooming(bool, PropertyBindingId),
+    ///
+    SetMinimapData(ExternalScrollId, MinimapData)
 }
 
 impl fmt::Debug for SceneMsg {
@@ -836,6 +833,7 @@ impl fmt::Debug for FrameMsg {
             FrameMsg::AppendDynamicProperties(..) => "FrameMsg::AppendDynamicProperties",
             FrameMsg::AppendDynamicTransformProperties(..) => "FrameMsg::AppendDynamicTransformProperties",
             FrameMsg::SetIsTransformAsyncZooming(..) => "FrameMsg::SetIsTransformAsyncZooming",
+            FrameMsg::SetMinimapData(..) => "FrameMsg::SetMinimapData",
         })
     }
 }
@@ -843,6 +841,7 @@ impl fmt::Debug for FrameMsg {
 bitflags!{
     /// Bit flags for WR stages to store in a capture.
     // Note: capturing `FRAME` without `SCENE` is not currently supported.
+    #[derive(Debug, Copy, PartialEq, Eq, Clone, PartialOrd, Ord, Hash)]
     pub struct CaptureBits: u8 {
         ///
         const SCENE = 0x1;
@@ -857,6 +856,7 @@ bitflags!{
 
 bitflags!{
     /// Mask for clearing caches in debug commands.
+    #[derive(Debug, Copy, PartialEq, Eq, Clone, PartialOrd, Ord, Hash)]
     pub struct ClearCache: u8 {
         ///
         const IMAGES = 0b1;
@@ -888,8 +888,6 @@ pub struct CapturedDocument {
 pub enum DebugCommand {
     /// Sets the provided debug flags.
     SetFlags(DebugFlags),
-    /// Configure if dual-source blending is used, if available.
-    EnableDualSourceBlending(bool),
     /// Save a capture of all the documents state.
     SaveCapture(PathBuf, CaptureBits),
     /// Load a capture of all the documents state.
@@ -1002,7 +1000,7 @@ impl RenderApiSender {
     /// Creates a new resource API object with a dedicated namespace.
     /// Namespace id is allocated by client.
     ///
-    /// The function could be used only when RendererOptions::namespace_alloc_by_client is true.
+    /// The function could be used only when WebRenderOptions::namespace_alloc_by_client is true.
     /// When the option is true, create_api() could not be used to prevent namespace id conflict.
     pub fn create_api_by_client(&self, namespace_id: IdNamespace) -> RenderApi {
         let msg = ApiMsg::CloneApiByClient(namespace_id);
@@ -1166,7 +1164,8 @@ impl RenderApi {
     }
 
     /// Update debugging flags.
-    pub fn set_debug_flags(&self, flags: DebugFlags) {
+    pub fn set_debug_flags(&mut self, flags: DebugFlags) {
+        self.resources.set_debug_flags(flags);
         let cmd = DebugCommand::SetFlags(flags);
         self.api_sender.send(ApiMsg::DebugCommand(cmd)).unwrap();
     }

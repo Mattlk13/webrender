@@ -8,6 +8,7 @@ use api::{
     RasterSpace, Shadow, YuvColorSpace, ColorRange, YuvFormat,
 };
 use api::units::*;
+use crate::composite::CompositorSurfaceKind;
 use crate::scene_building::{CreateShadow, IsVisible};
 use crate::frame_builder::{FrameBuildingContext, FrameBuildingState};
 use crate::gpu_cache::{GpuCache, GpuDataRequest};
@@ -256,12 +257,13 @@ impl ImageData {
                             kind: RenderTaskCacheKeyKind::Image(image_cache_key),
                         },
                         frame_state.gpu_cache,
+                        &mut frame_state.frame_gpu_data.f32,
                         frame_state.rg_builder,
                         None,
                         descriptor.is_opaque(),
                         RenderTaskParent::Surface(parent_surface),
                         &mut frame_state.surface_builder,
-                        |rg_builder| {
+                        |rg_builder, _| {
                             // Create a task to blit from the texture cache to
                             // a normal transient render task surface.
                             // TODO: figure out if/when we can do a blit instead.
@@ -302,7 +304,8 @@ impl ImageData {
                 // produce primitives that are partially covering the original image
                 // rect and we want to clip these extra parts out.
                 let tight_clip_rect = visibility
-                    .combined_local_clip_rect
+                    .clip_chain
+                    .local_clip_rect
                     .intersection(&common.prim_rect).unwrap();
                 image_instance.tight_local_clip_rect = tight_clip_rect;
 
@@ -453,7 +456,7 @@ impl InternablePrimitive for Image {
         PrimitiveInstanceKind::Image {
             data_handle,
             image_instance_index,
-            is_compositor_surface: false,
+            compositor_surface_kind: CompositorSurfaceKind::Blit,
         }
     }
 }
@@ -650,7 +653,7 @@ impl InternablePrimitive for YuvImage {
         PrimitiveInstanceKind::YuvImage {
             data_handle,
             segment_instance_index: SegmentInstanceIndex::INVALID,
-            is_compositor_surface: false,
+            compositor_surface_kind: CompositorSurfaceKind::Blit,
         }
     }
 }

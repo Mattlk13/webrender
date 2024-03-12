@@ -17,13 +17,14 @@ use crate::util::{FastTransform, LayoutToWorldFastTransform, MatrixHelpers, Scal
 use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
 use crate::util::TransformedRectKind;
+use peek_poke::PeekPoke;
 
 
 /// An id that identifies coordinate systems in the SpatialTree. Each
 /// coordinate system has an id and those ids will be shared when the coordinates
 /// system are the same or are in the same axis-aligned space. This allows
 /// for optimizing mask generation.
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "capture", derive(Serialize))]
 #[cfg_attr(feature = "replay", derive(Deserialize))]
 pub struct CoordinateSystemId(pub u32);
@@ -51,7 +52,7 @@ impl CoordinateSystem {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, Hash, MallocSizeOf, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, Hash, MallocSizeOf, PartialEq, PeekPoke, Default)]
 #[cfg_attr(feature = "capture", derive(Serialize))]
 #[cfg_attr(feature = "replay", derive(Deserialize))]
 pub struct SpatialNodeIndex(pub u32);
@@ -720,6 +721,14 @@ impl<Src, Dst> CoordinateSpaceMapping<Src, Dst> {
         }
     }
 
+    pub fn is_2d_scale_translation(&self) -> bool {
+        match *self {
+            CoordinateSpaceMapping::Local |
+            CoordinateSpaceMapping::ScaleOffset(_) => true,
+            CoordinateSpaceMapping::Transform(ref transform) => transform.is_2d_scale_translation(),
+        }
+    }
+
     pub fn scale_factors(&self) -> (f32, f32) {
         match *self {
             CoordinateSpaceMapping::Local => (1.0, 1.0),
@@ -910,6 +919,31 @@ impl SpatialTree {
         });
     }
 
+    pub fn get_last_sampled_scroll_offsets(
+        &self,
+    ) -> FastHashMap<ExternalScrollId, Vec<SampledScrollOffset>> {
+        let mut result = FastHashMap::default();
+        self.visit_nodes(|_, node| {
+            if let SpatialNodeType::ScrollFrame(ref scrolling) = node.node_type {
+                result.insert(scrolling.external_id, scrolling.offsets.clone());
+            }
+        });
+        result
+    }
+
+    pub fn apply_last_sampled_scroll_offsets(
+        &mut self,
+        last_sampled_offsets: FastHashMap<ExternalScrollId, Vec<SampledScrollOffset>>,
+    ) {
+        self.visit_nodes_mut(|_, node| {
+            if let SpatialNodeType::ScrollFrame(ref mut scrolling) = node.node_type {
+                if let Some(offsets) = last_sampled_offsets.get(&scrolling.external_id) {
+                    scrolling.offsets = offsets.clone();
+                }
+            }
+        });
+    }
+
     pub fn get_spatial_node(&self, index: SpatialNodeIndex) -> &SpatialNode {
         &self.spatial_nodes[index.0 as usize]
     }
@@ -1043,7 +1077,10 @@ impl SpatialTree {
             if index == self.root_reference_frame_index {
                 CoordinateSpaceMapping::Local
             } else {
-                CoordinateSpaceMapping::ScaleOffset(child.content_transform)
+              match scroll {
+                TransformScroll::Scrolled => CoordinateSpaceMapping::ScaleOffset(child.content_transform),
+                TransformScroll::Unscrolled => CoordinateSpaceMapping::ScaleOffset(child.viewport_transform),
+              }
             }
         } else {
             let system = &self.coord_systems[child.coordinate_system_id.0 as usize];
@@ -1969,4 +2006,82 @@ fn test_find_scroll_root_2d_scale() {
     );
 
     assert_eq!(st.find_scroll_root(sub_scroll), sub_scroll);
+}
+
+#[test]
+fn test_world_transforms() {
+  // Create a spatial tree with a scroll frame node with scroll offset (0, 200).
+  let mut cst = SceneSpatialTree::new();
+  let pid = PipelineInstanceId::new(0);
+  let scroll = cst.add_scroll_frame(
+      cst.root_reference_frame_index(),
+      ExternalScrollId(1, PipelineId::dummy()),
+      PipelineId::dummy(),
+      &LayoutRect::from_size(LayoutSize::new(400.0, 400.0)),
+      &LayoutSize::new(400.0, 800.0),
+      ScrollFrameKind::Explicit, 
+      LayoutVector2D::new(0.0, 200.0),
+      APZScrollGeneration::default(),
+      HasScrollLinkedEffect::No,
+      SpatialNodeUid::external(SpatialTreeItemKey::new(0, 1), PipelineId::dummy(), pid));
+
+  let mut st = SpatialTree::new();
+  st.apply_updates(cst.end_frame_and_get_pending_updates());
+  st.update_tree(&SceneProperties::new());
+
+  // The node's world transform should reflect the scroll offset,
+  // e.g. here it should be (0, -200) to reflect that the content has been
+  // scrolled up by 200px.
+  assert_eq!(
+      st.get_world_transform(scroll).into_transform(),
+      LayoutToWorldTransform::translation(0.0, -200.0, 0.0));
+
+  // The node's world viewport transform only reflects enclosing scrolling
+  // or transforms. Here we don't have any, so it should be the identity.
+  assert_eq!(
+      st.get_world_viewport_transform(scroll).into_transform(),
+      LayoutToWorldTransform::identity());
+}
+
+/// Tests that a spatial node that is async zooming and all of its descendants
+/// are correctly marked as having themselves an ancestor that is zooming.
+#[test]
+fn test_is_ancestor_or_self_zooming() {
+    let mut cst = SceneSpatialTree::new();
+    let root_reference_frame_index = cst.root_reference_frame_index();
+
+    let root = add_reference_frame(
+        &mut cst,
+        root_reference_frame_index,
+        LayoutTransform::identity(),
+        LayoutVector2D::zero(),
+        SpatialTreeItemKey::new(0, 0),
+    );
+    let child1 = add_reference_frame(
+        &mut cst,
+        root,
+        LayoutTransform::identity(),
+        LayoutVector2D::zero(),
+        SpatialTreeItemKey::new(0, 1),
+    );
+    let child2 = add_reference_frame(
+        &mut cst,
+        child1,
+        LayoutTransform::identity(),
+        LayoutVector2D::zero(),
+        SpatialTreeItemKey::new(0, 2),
+    );
+
+    let mut st = SpatialTree::new();
+    st.apply_updates(cst.end_frame_and_get_pending_updates());
+
+    // Mark the root node as async zooming
+    st.get_spatial_node_mut(root).is_async_zooming = true;
+    st.update_tree(&SceneProperties::new());
+
+    // Ensure that the root node and all descendants are marked as having
+    // themselves or an ancestor zooming
+    assert!(st.get_spatial_node(root).is_ancestor_or_self_zooming);
+    assert!(st.get_spatial_node(child1).is_ancestor_or_self_zooming);
+    assert!(st.get_spatial_node(child2).is_ancestor_or_self_zooming);
 }

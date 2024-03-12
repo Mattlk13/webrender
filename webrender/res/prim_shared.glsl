@@ -19,23 +19,18 @@ uniform sampler2D sClipMask;
 
 #ifndef SWGL_CLIP_MASK
 // TODO: convert back to RectWithEndpoint if driver issues are resolved, if ever.
-flat varying vec4 vClipMaskUvBounds;
-varying vec2 vClipMaskUv;
+flat varying mediump vec4 vClipMaskUvBounds;
+varying highp vec2 vClipMaskUv;
 #endif
 
 #ifdef WR_VERTEX_SHADER
 
-#define COLOR_MODE_FROM_PASS            0
-#define COLOR_MODE_ALPHA                1
-#define COLOR_MODE_SUBPX_CONST_COLOR    2
-#define COLOR_MODE_SUBPX_BG_PASS0       3
-#define COLOR_MODE_SUBPX_BG_PASS1       4
-#define COLOR_MODE_SUBPX_BG_PASS2       5
-#define COLOR_MODE_SUBPX_DUAL_SOURCE    6
-#define COLOR_MODE_BITMAP_SHADOW        7
-#define COLOR_MODE_COLOR_BITMAP         8
-#define COLOR_MODE_IMAGE                9
-#define COLOR_MODE_MULTIPLY_DUAL_SOURCE 10
+#define COLOR_MODE_ALPHA                0
+#define COLOR_MODE_SUBPX_DUAL_SOURCE    1
+#define COLOR_MODE_BITMAP_SHADOW        2
+#define COLOR_MODE_COLOR_BITMAP         3
+#define COLOR_MODE_IMAGE                4
+#define COLOR_MODE_MULTIPLY_DUAL_SOURCE 5
 
 uniform HIGHP_SAMPLER_FLOAT sampler2D sPrimitiveHeadersF;
 uniform HIGHP_SAMPLER_FLOAT isampler2D sPrimitiveHeadersI;
@@ -49,7 +44,6 @@ PER_INSTANCE in ivec4 aData;
 struct Instance
 {
     int prim_header_address;
-    int picture_task_address;
     int clip_address;
     int segment_index;
     int flags;
@@ -61,8 +55,7 @@ Instance decode_instance_attributes() {
     Instance instance;
 
     instance.prim_header_address = aData.x;
-    instance.picture_task_address = aData.y >> 16;
-    instance.clip_address = aData.y & 0xffff;
+    instance.clip_address = aData.y;
     instance.segment_index = aData.z & 0xffff;
     instance.flags = aData.z >> 16;
     instance.resource_address = aData.w & 0xffffff;
@@ -77,6 +70,7 @@ struct PrimitiveHeader {
     float z;
     int specific_prim_address;
     int transform_id;
+    int picture_task_address;
     ivec4 user_data;
 };
 
@@ -95,6 +89,7 @@ PrimitiveHeader fetch_prim_header(int index) {
     ph.z = float(data0.x);
     ph.specific_prim_address = data0.y;
     ph.transform_id = data0.z;
+    ph.picture_task_address = data0.w;
     ph.user_data = data1;
 
     return ph;

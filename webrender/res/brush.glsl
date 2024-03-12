@@ -47,7 +47,7 @@
 ///
 
 #if (defined(WR_FEATURE_ALPHA_PASS) || defined(WR_FEATURE_ANTIALIASING)) && !defined(SWGL_ANTIALIAS)
-varying vec2 v_local_pos;
+varying highp vec2 v_local_pos;
 #endif
 
 #ifdef WR_VERTEX_SHADER
@@ -83,9 +83,11 @@ void text_shader_main(
 #define BRUSH_FLAG_SEGMENT_REPEAT_Y             8
 #define BRUSH_FLAG_SEGMENT_REPEAT_X_ROUND      16
 #define BRUSH_FLAG_SEGMENT_REPEAT_Y_ROUND      32
-#define BRUSH_FLAG_SEGMENT_NINEPATCH_MIDDLE    64
-#define BRUSH_FLAG_TEXEL_RECT                 128
-#define BRUSH_FLAG_FORCE_AA                   256
+#define BRUSH_FLAG_SEGMENT_REPEAT_X_CENTERED   64
+#define BRUSH_FLAG_SEGMENT_REPEAT_Y_CENTERED  128
+#define BRUSH_FLAG_SEGMENT_NINEPATCH_MIDDLE   256
+#define BRUSH_FLAG_TEXEL_RECT                 512
+#define BRUSH_FLAG_FORCE_AA                  1024
 
 #define INVALID_SEGMENT_INDEX                   0xffff
 
@@ -212,7 +214,7 @@ void main(void) {
     Instance instance = decode_instance_attributes();
     PrimitiveHeader ph = fetch_prim_header(instance.prim_header_address);
     Transform transform = fetch_transform(ph.transform_id);
-    PictureTask task = fetch_picture_task(instance.picture_task_address);
+    PictureTask task = fetch_picture_task(ph.picture_task_address);
     ClipArea clip_area = fetch_clip_area(instance.clip_address);
 
     WR_VERTEX_SHADER_MAIN_FUNCTION(instance, ph, transform, task, clip_area);

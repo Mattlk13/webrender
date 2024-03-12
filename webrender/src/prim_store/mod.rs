@@ -9,16 +9,17 @@ use api::{PrimitiveKeyKind, FillRule, POLYGON_CLIP_VERTEX_MAX};
 use api::units::*;
 use euclid::{SideOffsets2D, Size2D};
 use malloc_size_of::MallocSizeOf;
+use crate::composite::CompositorSurfaceKind;
+use crate::clip::ClipLeafId;
 use crate::segment::EdgeAaSegmentMask;
 use crate::border::BorderSegmentCacheKey;
-use crate::clip::{ClipChainId, ClipSet};
 use crate::debug_item::{DebugItem, DebugMessage};
 use crate::debug_colors;
 use crate::scene_building::{CreateShadow, IsVisible};
 use crate::frame_builder::FrameBuildingState;
-use crate::glyph_rasterizer::GlyphKey;
+use glyph_rasterizer::GlyphKey;
 use crate::gpu_cache::{GpuCacheAddress, GpuCacheHandle, GpuDataRequest};
-use crate::gpu_types::{BrushFlags};
+use crate::gpu_types::{BrushFlags, QuadSegment};
 use crate::intern;
 use crate::picture::PicturePrimitive;
 use crate::render_task_graph::RenderTaskId;
@@ -654,6 +655,7 @@ impl InternablePrimitive for PrimitiveKeyKind {
                     data_handle,
                     segment_instance_index: SegmentInstanceIndex::INVALID,
                     color_binding_index,
+                    use_legacy_path: false,
                 }
             }
         }
@@ -666,6 +668,7 @@ impl InternablePrimitive for PrimitiveKeyKind {
 pub struct VisibleMaskImageTile {
     pub tile_offset: TileOffset,
     pub tile_rect: LayoutRect,
+    pub task_id: RenderTaskId,
 }
 
 #[derive(Debug)]
@@ -900,7 +903,6 @@ pub struct NinePatchDescriptor {
     pub fill: bool,
     pub repeat_horizontal: RepeatMode,
     pub repeat_vertical: RepeatMode,
-    pub outset: SideOffsetsKey,
     pub widths: SideOffsetsKey,
 }
 
@@ -958,7 +960,6 @@ pub enum PrimitiveInstanceKind {
         /// Handle to the common interned data for this primitive.
         data_handle: PictureDataHandle,
         pic_index: PictureIndex,
-        segment_instance_index: SegmentInstanceIndex,
     },
     /// A run of glyphs, with associated font parameters.
     TextRun {
@@ -996,18 +997,19 @@ pub enum PrimitiveInstanceKind {
         data_handle: PrimitiveDataHandle,
         segment_instance_index: SegmentInstanceIndex,
         color_binding_index: ColorBindingIndex,
+        use_legacy_path: bool,
     },
     YuvImage {
         /// Handle to the common interned data for this primitive.
         data_handle: YuvImageDataHandle,
         segment_instance_index: SegmentInstanceIndex,
-        is_compositor_surface: bool,
+        compositor_surface_kind: CompositorSurfaceKind,
     },
     Image {
         /// Handle to the common interned data for this primitive.
         data_handle: ImageDataHandle,
         image_instance_index: ImageInstanceIndex,
-        is_compositor_surface: bool,
+        compositor_surface_kind: CompositorSurfaceKind,
     },
     /// Always rendered directly into the picture. This tends to be
     /// faster with SWGL.
@@ -1072,28 +1074,23 @@ pub struct PrimitiveInstance {
     pub kind: PrimitiveInstanceKind,
 
     /// All information and state related to clip(s) for this primitive
-    pub clip_set: ClipSet,
+    pub clip_leaf_id: ClipLeafId,
 
     /// Information related to the current visibility state of this
     /// primitive.
     // TODO(gw): Currently built each frame, but can be retained.
-    // TODO(gw): Remove clipped_world_rect (use tile bounds to determine vis flags)
     pub vis: PrimitiveVisibility,
 }
 
 impl PrimitiveInstance {
     pub fn new(
-        local_clip_rect: LayoutRect,
         kind: PrimitiveInstanceKind,
-        clip_chain_id: ClipChainId,
+        clip_leaf_id: ClipLeafId,
     ) -> Self {
         PrimitiveInstance {
             kind,
             vis: PrimitiveVisibility::new(),
-            clip_set: ClipSet {
-                local_clip_rect,
-                clip_chain_id,
-            },
+            clip_leaf_id,
         }
     }
 
@@ -1216,6 +1213,9 @@ pub struct PrimitiveScratchBuffer {
 
     /// Set of sub-graphs that are required, determined during visibility pass
     pub required_sub_graphs: FastHashSet<PictureIndex>,
+
+    /// Temporary buffer for building segments in to during prepare pass
+    pub quad_segments: Vec<QuadSegment>,
 }
 
 impl Default for PrimitiveScratchBuffer {
@@ -1230,6 +1230,7 @@ impl Default for PrimitiveScratchBuffer {
             debug_items: Vec::new(),
             messages: Vec::new(),
             required_sub_graphs: FastHashSet::default(),
+            quad_segments: Vec::new(),
         }
     }
 }
@@ -1243,6 +1244,7 @@ impl PrimitiveScratchBuffer {
         self.segment_instances.recycle(recycler);
         self.gradient_tiles.recycle(recycler);
         recycler.recycle_vec(&mut self.debug_items);
+        recycler.recycle_vec(&mut self.quad_segments);
     }
 
     pub fn begin_frame(&mut self) {
@@ -1251,6 +1253,7 @@ impl PrimitiveScratchBuffer {
         // location.
         self.clip_mask_instances.clear();
         self.clip_mask_instances.push(ClipMaskKind::None);
+        self.quad_segments.clear();
 
         self.border_cache_handles.clear();
 
@@ -1307,6 +1310,37 @@ impl PrimitiveScratchBuffer {
 
             y -= LINE_HEIGHT;
         }
+    }
+
+    pub fn push_debug_rect_with_stroke_width(
+        &mut self,
+        rect: WorldRect,
+        border: ColorF,
+        stroke_width: f32
+    ) {
+        let top_edge = WorldRect::new(
+            WorldPoint::new(rect.min.x + stroke_width, rect.min.y),
+            WorldPoint::new(rect.max.x - stroke_width, rect.min.y + stroke_width)
+        );
+        self.push_debug_rect(top_edge * DevicePixelScale::new(1.0), border, border);
+
+        let bottom_edge = WorldRect::new(
+            WorldPoint::new(rect.min.x + stroke_width, rect.max.y - stroke_width),
+            WorldPoint::new(rect.max.x - stroke_width, rect.max.y)
+        );
+        self.push_debug_rect(bottom_edge * DevicePixelScale::new(1.0), border, border);
+
+        let right_edge = WorldRect::new(
+            WorldPoint::new(rect.max.x - stroke_width, rect.min.y),
+            rect.max
+        );
+        self.push_debug_rect(right_edge * DevicePixelScale::new(1.0), border, border);
+
+        let left_edge = WorldRect::new(
+            rect.min,
+            WorldPoint::new(rect.min.x + stroke_width, rect.max.y)
+        );
+        self.push_debug_rect(left_edge * DevicePixelScale::new(1.0), border, border);
     }
 
     #[allow(dead_code)]
@@ -1444,7 +1478,7 @@ fn test_struct_sizes() {
     //     test expectations and move on.
     // (b) You made a structure larger. This is not necessarily a problem, but should only
     //     be done with care, and after checking if talos performance regresses badly.
-    assert_eq!(mem::size_of::<PrimitiveInstance>(), 136, "PrimitiveInstance size changed");
+    assert_eq!(mem::size_of::<PrimitiveInstance>(), 88, "PrimitiveInstance size changed");
     assert_eq!(mem::size_of::<PrimitiveInstanceKind>(), 24, "PrimitiveInstanceKind size changed");
     assert_eq!(mem::size_of::<PrimitiveTemplate>(), 56, "PrimitiveTemplate size changed");
     assert_eq!(mem::size_of::<PrimitiveTemplateKind>(), 28, "PrimitiveTemplateKind size changed");

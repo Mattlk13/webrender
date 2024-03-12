@@ -49,12 +49,12 @@ pub mod desc {
             VertexAttribute {
                 name: "aBlurRenderTaskAddress",
                 count: 1,
-                kind: VertexAttributeKind::U16,
+                kind: VertexAttributeKind::I32,
             },
             VertexAttribute {
                 name: "aBlurSourceTaskAddress",
                 count: 1,
-                kind: VertexAttributeKind::U16,
+                kind: VertexAttributeKind::I32,
             },
             VertexAttribute {
                 name: "aBlurDirection",
@@ -488,53 +488,6 @@ pub mod desc {
         ],
     };
 
-    pub const CLIP_IMAGE: VertexDescriptor = VertexDescriptor {
-        vertex_attributes: &[VertexAttribute {
-            name: "aPosition",
-            count: 2,
-            kind: VertexAttributeKind::U8Norm,
-        }],
-        instance_attributes: &[
-            // common clip attributes
-            VertexAttribute {
-                name: "aClipDeviceArea",
-                count: 4,
-                kind: VertexAttributeKind::F32,
-            },
-            VertexAttribute {
-                name: "aClipOrigins",
-                count: 4,
-                kind: VertexAttributeKind::F32,
-            },
-            VertexAttribute {
-                name: "aDevicePixelScale",
-                count: 1,
-                kind: VertexAttributeKind::F32,
-            },
-            VertexAttribute {
-                name: "aTransformIds",
-                count: 2,
-                kind: VertexAttributeKind::I32,
-            },
-            // specific clip attributes
-            VertexAttribute {
-                name: "aClipTileRect",
-                count: 4,
-                kind: VertexAttributeKind::F32,
-            },
-            VertexAttribute {
-                name: "aClipDataResourceAddress",
-                count: 2,
-                kind: VertexAttributeKind::U16,
-            },
-            VertexAttribute {
-                name: "aClipLocalRect",
-                count: 4,
-                kind: VertexAttributeKind::F32,
-            },
-        ],
-    };
-
     pub const GPU_CACHE_UPDATE: VertexDescriptor = VertexDescriptor {
         vertex_attributes: &[
             VertexAttribute {
@@ -574,17 +527,17 @@ pub mod desc {
             VertexAttribute {
                 name: "aFilterRenderTaskAddress",
                 count: 1,
-                kind: VertexAttributeKind::U16,
+                kind: VertexAttributeKind::I32,
             },
             VertexAttribute {
                 name: "aFilterInput1TaskAddress",
                 count: 1,
-                kind: VertexAttributeKind::U16,
+                kind: VertexAttributeKind::I32,
             },
             VertexAttribute {
                 name: "aFilterInput2TaskAddress",
                 count: 1,
-                kind: VertexAttributeKind::U16,
+                kind: VertexAttributeKind::I32,
             },
             VertexAttribute {
                 name: "aFilterKind",
@@ -602,9 +555,34 @@ pub mod desc {
                 kind: VertexAttributeKind::U16,
             },
             VertexAttribute {
+                name: "aUnused",
+                count: 1,
+                kind: VertexAttributeKind::U16,
+            },
+            VertexAttribute {
                 name: "aFilterExtraDataAddress",
                 count: 2,
                 kind: VertexAttributeKind::U16,
+            },
+        ],
+    };
+
+    pub const MASK: VertexDescriptor = VertexDescriptor {
+        vertex_attributes: &[VertexAttribute {
+            name: "aPosition",
+            count: 2,
+            kind: VertexAttributeKind::U8Norm,
+        }],
+        instance_attributes: &[
+            VertexAttribute {
+                name: "aData",
+                count: 4,
+                kind: VertexAttributeKind::I32,
+            },
+            VertexAttribute {
+                name: "aClipData",
+                count: 4,
+                kind: VertexAttributeKind::I32,
             },
         ],
     };
@@ -789,7 +767,6 @@ pub mod desc {
 pub enum VertexArrayKind {
     Primitive,
     Blur,
-    ClipImage,
     ClipRect,
     ClipBoxShadow,
     VectorStencil,
@@ -806,6 +783,7 @@ pub enum VertexArrayKind {
     Composite,
     Clear,
     Copy,
+    Mask,
 }
 
 pub struct VertexDataTexture<T> {
@@ -1017,7 +995,6 @@ pub struct RendererVAOs {
     blur_vao: VAO,
     clip_rect_vao: VAO,
     clip_box_shadow_vao: VAO,
-    clip_image_vao: VAO,
     border_vao: VAO,
     line_vao: VAO,
     scale_vao: VAO,
@@ -1030,6 +1007,7 @@ pub struct RendererVAOs {
     composite_vao: VAO,
     clear_vao: VAO,
     copy_vao: VAO,
+    mask_vao: VAO,
 }
 
 impl RendererVAOs {
@@ -1064,7 +1042,6 @@ impl RendererVAOs {
             clip_rect_vao: device.create_vao_with_new_instances(&desc::CLIP_RECT, &prim_vao),
             clip_box_shadow_vao: device
                 .create_vao_with_new_instances(&desc::CLIP_BOX_SHADOW, &prim_vao),
-            clip_image_vao: device.create_vao_with_new_instances(&desc::CLIP_IMAGE, &prim_vao),
             border_vao: device.create_vao_with_new_instances(&desc::BORDER, &prim_vao),
             scale_vao: device.create_vao_with_new_instances(&desc::SCALE, &prim_vao),
             line_vao: device.create_vao_with_new_instances(&desc::LINE, &prim_vao),
@@ -1077,6 +1054,7 @@ impl RendererVAOs {
             composite_vao: device.create_vao_with_new_instances(&desc::COMPOSITE, &prim_vao),
             clear_vao: device.create_vao_with_new_instances(&desc::CLEAR, &prim_vao),
             copy_vao: device.create_vao_with_new_instances(&desc::COPY, &prim_vao),
+            mask_vao: device.create_vao_with_new_instances(&desc::MASK, &prim_vao),
             prim_vao,
         }
     }
@@ -1086,7 +1064,6 @@ impl RendererVAOs {
         device.delete_vao(self.resolve_vao);
         device.delete_vao(self.clip_rect_vao);
         device.delete_vao(self.clip_box_shadow_vao);
-        device.delete_vao(self.clip_image_vao);
         device.delete_vao(self.fast_linear_gradient_vao);
         device.delete_vao(self.linear_gradient_vao);
         device.delete_vao(self.radial_gradient_vao);
@@ -1099,6 +1076,7 @@ impl RendererVAOs {
         device.delete_vao(self.composite_vao);
         device.delete_vao(self.clear_vao);
         device.delete_vao(self.copy_vao);
+        device.delete_vao(self.mask_vao);
     }
 }
 
@@ -1107,7 +1085,6 @@ impl ops::Index<VertexArrayKind> for RendererVAOs {
     fn index(&self, kind: VertexArrayKind) -> &VAO {
         match kind {
             VertexArrayKind::Primitive => &self.prim_vao,
-            VertexArrayKind::ClipImage => &self.clip_image_vao,
             VertexArrayKind::ClipRect => &self.clip_rect_vao,
             VertexArrayKind::ClipBoxShadow => &self.clip_box_shadow_vao,
             VertexArrayKind::Blur => &self.blur_vao,
@@ -1124,6 +1101,7 @@ impl ops::Index<VertexArrayKind> for RendererVAOs {
             VertexArrayKind::Composite => &self.composite_vao,
             VertexArrayKind::Clear => &self.clear_vao,
             VertexArrayKind::Copy => &self.copy_vao,
+            VertexArrayKind::Mask => &self.mask_vao,
         }
     }
 }
